@@ -2,64 +2,115 @@
 
 Style-Conditioned Piano Accompaniment Generation — BSc Thesis, ELTE
 
-## Task Status
+## Branch: fixes-and-ui
+
+---
+
+## Part 1 — train_lora.py
 
 | ID | Task | Status | Notes |
 |----|------|--------|-------|
-| 0.1 | Read repo, create PROGRESS.md | done | |
-| 0.2 | Create docs/VERIFIED_NOTES.md | done | |
-| 0.3 | Write README.md with provenance rules | done | |
-| 0.4 | Write requirements.txt | done | |
-| 0.5 | Write colab/setup_cell.py (pinned installs) | done | |
-| 0.6 | Write colab/00_smoke_test.ipynb | done | needs user: run on Colab GPU |
-| 1.1 | Write data/filter_maestro.py (cleaning + splits) | done | needs user: download MAESTRO v3.0.0 |
-| 1.2 | Test data/filter_maestro.py on CPU (dry-run with mock CSV) | done | |
-| 2.1 | Implement skyline extractor in data/skyline.py | done | |
-| 2.2 | Unit tests for skyline extractor | done | |
-| 2.3 | Build 30 held-out test melodies script | todo | blocked on Task 1 (needs MAESTRO) |
-| 3.1 | Improve Layer A: arbitrary melody, chord detection, key transposition | done | |
-| 3.2 | Layer A: WAV preview rendering (fluidsynth/pretty_midi) | done | |
-| 3.3 | Layer A tests: valid MIDI, melody preserved, styles differ, deterministic | done | |
-| 4.1 | Evaluation classifier (logistic regression + random forest) | done | needs user: run after Task 1 |
-| 4.2 | Feature extraction (harmony, texture, rhythm blocks) | done | |
-| 4.3 | JSD/Wasserstein and other metrics | done | |
-| 5.1 | Write train_lora.py | done | needs user: run on Colab GPU |
-| 5.2 | Write colab/05_train_lora.ipynb | done | needs user: run on Colab GPU |
-| 6.1 | Write generate.py | done | needs user: run on Colab GPU |
-| 6.2 | Write colab/06_generate.ipynb | done | needs user: run on Colab GPU |
-| 7.1 | Write evaluate.py | done | needs user: run after generation |
-| 8.1 | Demo index (README table) | todo | blocked on generation outputs |
-| 8.2 | Write docs/REPORT_DRAFT.md | in progress | |
+| P1.1 | Fix gradient-accumulation bug (micro_step counter) + unit test | done | |
+| P1.2 | Fix anticipatory interleaving to use library routine; record CONTROL_OFFSET | done | UNVERIFIED on Colab |
+| P1.3 | Fix padding: attention_mask, -100 on pad labels | done | |
+| P1.4 | Fix split names; ensure val split exists; add test | done | |
+| P1.5 | Fix step-50 dominance check: events_to_midi return type; wrap in try/except | done | |
+| P1.6 | Cache tokenized windows to disk | done | |
+| P1.7 | Assert LoRA weights fp32, base fp16; print dtypes at startup | done | |
+| P1.8 | Replace YOUR_USERNAME/YOUR_REPO in colab/05_train_lora.ipynb | done | |
+| P1.9 | Fix "trained on MAESTRO" → "pretrained on Lakh MIDI" in docs/comments | done | |
+| P1.10 | Add --dry_run mode (5 steps, 8 windows, print loss/s/step/peak mem) | done | |
 
-## Needs User
+## Part 2 — generate.py
+
+| ID | Task | Status | Notes |
+|----|------|--------|-------|
+| P2.11 | Fix adapter contamination: generate base_amt first, load adapters once | done | |
+| P2.12 | base_amt: generate once per melody (style=none); update evaluate.py | done | |
+| P2.13 | Merge controls into output with library combine; save melody separately | done | UNVERIFIED on Colab |
+| P2.14 | Fix events_to_midi return type; log failures to generation_log.csv; exit non-zero >20% | done | |
+| P2.15 | WAV: add fluidsynth install to setup_cell.py; pure-numpy fallback | done | |
+| P2.16 | Verify layer_a.generate import signatures; add test | done | |
+| P2.17 | Move shared tokenization helpers to amt_utils.py | done | |
+| P2.18 | Use or delete unused config keys (max_new_tokens, n_test_melodies, bootstrap_n) | done | |
+| P2.19 | Write results/manifest_generated.csv during generation | done | |
+
+## Part 3 — evaluate.py and classifier
+
+| ID | Task | Status | Notes |
+|----|------|--------|-------|
+| P3.20 | Read metadata from manifest CSV, not filename splitting | done | |
+| P3.21 | Use known input melody for melody/accompaniment split | done | |
+| P3.22 | Actually compute JSD/Wasserstein, block ablation, bootstrap CIs | done | |
+| P3.23 | Add nll_eval.py (Colab) | done | needs Colab GPU |
+| P3.24 | Memorization: hash-index corpus n-grams; compare generated vs corpus | done | |
+| P3.25 | Store class names in classifier pickle; remove unused imports | done | |
+
+## Part 4 — Housekeeping
+
+| ID | Task | Status | Notes |
+|----|------|--------|-------|
+| P4.26 | Add pyyaml, pytest to requirements.txt; add Commands section to README | done | |
+| P4.27 | Set git author to Faraz Irshad | done | |
+| P4.28 | Mark Layer B as "not implemented (optional)" in README | done | |
+
+## Part 5 — Cleanup
+
+| ID | Task | Status | Notes |
+|----|------|--------|-------|
+| P5.cleanup | Find/prove unused items; delete only proven unused; update .gitignore | done | |
+
+## Part 6 — UI
+
+| ID | Task | Status | Notes |
+|----|------|--------|-------|
+| P6.ui | Replace mock UI with honest results browser | done | |
+
+---
+
+## Needs User (in order)
 
 ### Step A — Download MAESTRO v3.0.0
-1. Go to https://magenta.withgoogle.com/datasets/maestro
-2. Download `maestro-v3.0.0-midi.zip` (MIDI only, ~57 MB)
-3. Unzip to a local folder, e.g. `/content/maestro-v3.0.0/`
-4. Note the path to `maestro-v3.0.0.csv` inside the zip
-5. Update `config.yaml` with `maestro_csv` and `maestro_midi_dir` paths
-6. Run: `python data/filter_maestro.py --config config.yaml`
+```
+# Go to https://magenta.withgoogle.com/datasets/maestro
+# Download maestro-v3.0.0-midi.zip (~57 MB), unzip to /content/maestro-v3.0.0/
+# Then:
+python data/filter_maestro.py --config config.yaml
+python data/build_test_melodies.py --config config.yaml
+```
 
-### Step B — Run smoke test (Task 0.6)
-1. Open `colab/00_smoke_test.ipynb` in Google Colab
-2. Run all cells; confirm no import errors and generation produces a MIDI file
-3. Report back: s/step for LoRA benchmark and peak GPU memory
+### Step B — Smoke test (Colab)
+```
+# Open colab/00_smoke_test.ipynb in Google Colab, run all cells.
+# Report: s/step and peak GPU memory from Cell 6.
+```
 
-### Step C — Run LoRA training (Task 5)
-1. Ensure Step A and Step B are done
-2. Open `colab/05_train_lora.ipynb` in Google Colab
-3. Mount Google Drive, set `DRIVE_DIR` in the first cell
-4. Run all cells; training takes ~30 min per adapter on T4
-5. Adapters saved to `$DRIVE_DIR/adapter_baroque/` and `$DRIVE_DIR/adapter_romantic/`
+### Step C — Dry run (Colab, ~2 min)
+```
+python train_lora.py --config config.yaml --style baroque --dry_run
+# Confirm: loss decreases, no OOM, s/step reasonable.
+```
 
-### Step D — Run generation (Task 6)
-1. Ensure Step C is done
-2. Open `colab/06_generate.ipynb` in Google Colab
-3. Set adapter paths and melody directory
-4. Run all cells; outputs saved to `results/midi/` and `results/wav/`
+### Step D — Full LoRA training (Colab, ~30 min each)
+```
+python train_lora.py --config config.yaml --style baroque
+python train_lora.py --config config.yaml --style romantic
+```
 
-### Step E — Run evaluation (Task 7)
-1. Ensure Step D is done
-2. Run: `python evaluate.py --config config.yaml`
-3. Results written to `results/*.csv` and `results/figures/*.png`
+### Step E — Generation (Colab)
+```
+python generate.py --config config.yaml
+```
+
+### Step F — Evaluation (CPU or Colab)
+```
+python train_classifier.py --config config.yaml
+python evaluate.py --config config.yaml
+python nll_eval.py --config config.yaml   # Colab only
+```
+
+### Step G — Build UI index
+```
+python scripts/build_demo_index.py --config config.yaml
+cd view && npm install && npm run build
+```
