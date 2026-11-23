@@ -6,6 +6,7 @@ import { useEffect, useRef } from 'react';
 export function HeroWaveform() {
   const { audioFile, selectedStyle } = useStore();
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -18,25 +19,54 @@ export function HeroWaveform() {
     const h = canvas.height;
 
     ctx.clearRect(0, 0, width, h);
-    
-    const gradient = ctx.createLinearGradient(0, 0, 0, h);
-    gradient.addColorStop(0, 'rgba(139, 92, 246, 0.8)');
-    gradient.addColorStop(0.5, 'rgba(139, 92, 246, 0.4)');
-    gradient.addColorStop(1, 'rgba(139, 92, 246, 0.1)');
 
-    ctx.fillStyle = gradient;
+    const drawWaveform = async () => {
+      try {
+        const audioContext = new AudioContext();
+        audioContextRef.current = audioContext;
+        const response = await fetch(audioFile.url);
+        const arrayBuffer = await response.arrayBuffer();
+        const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+        
+        const rawData = audioBuffer.getChannelData(0);
+        const samples = 200;
+        const blockSize = Math.floor(rawData.length / samples);
+        const filteredData = [];
+        
+        for (let i = 0; i < samples; i++) {
+          let sum = 0;
+          for (let j = 0; j < blockSize; j++) {
+            sum += Math.abs(rawData[i * blockSize + j]);
+          }
+          filteredData.push(sum / blockSize);
+        }
+        
+        const gradient = ctx.createLinearGradient(0, 0, 0, h);
+        gradient.addColorStop(0, 'rgba(139, 92, 246, 0.8)');
+        gradient.addColorStop(0.5, 'rgba(139, 92, 246, 0.4)');
+        gradient.addColorStop(1, 'rgba(139, 92, 246, 0.1)');
+        ctx.fillStyle = gradient;
+        
+        const barWidth = width / samples;
+        const max = Math.max(...filteredData);
+        
+        for (let i = 0; i < samples; i++) {
+          const x = i * barWidth;
+          const amplitude = filteredData[i] / max;
+          const barHeight = amplitude * h * 0.9;
+          const y = (h - barHeight) / 2;
+          ctx.fillRect(x, y, barWidth * 0.8, barHeight);
+        }
+      } catch (err) {
+        console.error('Failed to draw waveform:', err);
+      }
+    };
 
-    const barCount = 200;
-    const barWidth = width / barCount;
-    
-    for (let i = 0; i < barCount; i++) {
-      const x = i * barWidth;
-      const amplitude = Math.sin(i * 0.1) * 0.3 + Math.random() * 0.4 + 0.2;
-      const barHeight = amplitude * h;
-      const y = (h - barHeight) / 2;
-      
-      ctx.fillRect(x, y, barWidth * 0.8, barHeight);
-    }
+    drawWaveform();
+
+    return () => {
+      audioContextRef.current?.close();
+    };
   }, [audioFile]);
 
   return (

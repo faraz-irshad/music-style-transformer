@@ -18,6 +18,9 @@ const STYLES: Style[] = [
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 async function generateMockAudio(duration: number): Promise<string> {
+  if (typeof AudioContext === 'undefined') {
+    return Promise.resolve(URL.createObjectURL(new Blob([], { type: 'audio/wav' })));
+  }
   const audioContext = new AudioContext();
   const sampleRate = audioContext.sampleRate;
   const buffer = audioContext.createBuffer(2, duration * sampleRate, sampleRate);

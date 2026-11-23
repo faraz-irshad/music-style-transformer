@@ -53,7 +53,7 @@ export function Header() {
           <ActionIcon variant="subtle" size="lg" onClick={() => notifications.show({ title: 'Help', message: 'Upload audio → Select style → Adjust parameters → Generate preview → Export' })} style={{ transition: 'all 0.2s' }}>
             <IconHelp size={18} />
           </ActionIcon>
-          <ActionIcon variant="subtle" size="lg" component="a" href="https://github.com" target="_blank" style={{ transition: 'all 0.2s' }}>
+          <ActionIcon variant="subtle" size="lg" component="a" href="https://github.com/faraz-irshad/music-style-transformer" target="_blank" style={{ transition: 'all 0.2s' }}>
             <IconBrandGithub size={18} />
           </ActionIcon>
         </Group>
