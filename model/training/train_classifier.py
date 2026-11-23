@@ -24,27 +24,37 @@ from sklearn.metrics import accuracy_score, f1_score
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import Pipeline
 
-from model.data.features import Note, extract_all
+from model.data.features import Note, extract_all, split_skyline
 
 
 # ---------------------------------------------------------------------------
 # Load windows from manifest
 # ---------------------------------------------------------------------------
 
-def load_window_notes(row: pd.Series) -> list[Note]:
+def load_window_notes(
+    row: pd.Series,
+    performance_cache: dict[str, list[Note]] | None = None,
+) -> list[Note]:
     """Load notes from a MIDI window (start_sec to end_sec)."""
     import pretty_midi
-    pm = pretty_midi.PrettyMIDI(row["midi_path"])
-    notes: list[Note] = []
-    for inst in pm.instruments:
-        if inst.is_drum:
-            continue
-        for n in inst.notes:
-            if n.start >= row["start_sec"] and n.end <= row["end_sec"]:
-                notes.append(Note(n.start - row["start_sec"],
-                                  n.end - row["start_sec"],
-                                  n.pitch, n.velocity))
-    return notes
+    midi_path = str(row["midi_path"])
+    if performance_cache is not None and midi_path in performance_cache:
+        performance_notes = performance_cache[midi_path]
+    else:
+        pm = pretty_midi.PrettyMIDI(midi_path)
+        performance_notes = [
+            Note(n.start, n.end, n.pitch, n.velocity)
+            for inst in pm.instruments if not inst.is_drum
+            for n in inst.notes
+        ]
+        if performance_cache is not None:
+            performance_cache[midi_path] = performance_notes
+    start, end = float(row["start_sec"]), float(row["end_sec"])
+    return [
+        Note(note.start - start, note.end - start, note.pitch, note.velocity)
+        for note in performance_notes
+        if note.start >= start and note.end <= end
+    ]
 
 
 def augment_transpose(notes: list[Note], semitones: int) -> list[Note]:
@@ -63,13 +73,15 @@ def build_dataset(
     rows = manifest[manifest["split"] == split].reset_index(drop=True)
     X_list, y_list, g_list = [], [], []
     label_map = {"baroque": 0, "romantic": 1}
+    performance_cache: dict[str, list[Note]] = {}
 
     for _, row in rows.iterrows():
         try:
-            notes = load_window_notes(row)
+            window_notes = load_window_notes(row, performance_cache)
         except Exception as e:
             print(f"  skip {row['window_id']}: {e}")
             continue
+        _, notes = split_skyline(window_notes)
         if len(notes) < 10:
             continue
 

@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from model.evaluation.evaluate import split_by_known_melody
+from model.data.features import split_skyline
 
 
 def _note(start: float, pitch: int):
@@ -48,3 +49,14 @@ def test_empty_reference_has_no_match_fraction():
     assert melody == []
     assert len(accompaniment) == 1
     assert fraction != fraction
+
+
+def test_skyline_split_removes_only_the_selected_melody_notes():
+    low = _note(0.0, 48)
+    high = _note(0.0, 72)
+    later_low = _note(0.5, 50)
+
+    melody, accompaniment = split_skyline([low, high, later_low])
+
+    assert melody == [high, later_low]
+    assert accompaniment == [low]

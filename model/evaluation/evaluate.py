@@ -37,6 +37,27 @@ def load_notes(midi_path: str) -> list:
     return notes
 
 
+def load_window_notes(
+    row: dict,
+    performance_cache: dict[str, list] | None = None,
+) -> list:
+    """Slice a manifest window from a performance parsed once per file."""
+    midi_path = str(row["midi_path"])
+    if performance_cache is not None and midi_path in performance_cache:
+        performance_notes = performance_cache[midi_path]
+    else:
+        performance_notes = load_notes(midi_path)
+        if performance_cache is not None:
+            performance_cache[midi_path] = performance_notes
+    start, end = float(row["start_sec"]), float(row["end_sec"])
+    from model.data.features import Note
+    return [
+        Note(note.start - start, note.end - start, note.pitch, note.velocity)
+        for note in performance_notes
+        if note.start >= start and note.end <= end
+    ]
+
+
 def split_by_known_melody(
     all_notes: list,
     melody_notes: list,
@@ -277,10 +298,11 @@ def main(config_path: str) -> None:
     from model.data.features import (
         extract_all, Note,
         pitch_class_entropy, fourgram_repetition_rate,
-        skyline_dominance, melody_clash_rate,
+        skyline_dominance, melody_clash_rate, split_skyline,
     )
 
     rows = []
+    generated_note_cache: dict[str, list] = {}
     for _, log_row in gen_log.iterrows():
         stem = log_row["file"]
         mel_id = log_row["melody_id"]
@@ -293,7 +315,10 @@ def main(config_path: str) -> None:
         if not midi_path.exists():
             continue
 
-        all_notes = load_notes(str(midi_path))
+        midi_key = str(midi_path)
+        if midi_key not in generated_note_cache:
+            generated_note_cache[midi_key] = load_notes(midi_key)
+        all_notes = generated_note_cache[midi_key]
         if not all_notes:
             continue
 
@@ -441,6 +466,7 @@ def main(config_path: str) -> None:
     print("\n--- Distribution distances vs real MAESTRO test set ---")
     manifest_path = Path(cfg["data"]["output_dir"]) / "manifest.csv"
     dist_results = {}
+    performance_cache: dict[str, list] = {}
     if manifest_path.exists():
         import pandas as _pd
         manifest = _pd.read_csv(manifest_path)
@@ -449,10 +475,11 @@ def main(config_path: str) -> None:
             real_notes_list = []
             for _, rrow in real_rows.iterrows():
                 try:
-                    notes = load_notes(rrow["midi_path"])
-                    real_notes_list.append(notes)
-                except Exception:
-                    pass
+                    notes = load_window_notes(rrow, performance_cache)
+                    _melody, accompaniment = split_skyline(notes)
+                    real_notes_list.append(accompaniment)
+                except Exception as exc:
+                    print(f"  Could not load real window {rrow['window_id']}: {exc}")
             if not real_notes_list:
                 continue
             for layer in df["layer"].unique():
@@ -462,9 +489,15 @@ def main(config_path: str) -> None:
                     mp = midi_dir / f"{grow['file']}.mid"
                     if mp.exists():
                         try:
-                            gen_notes_list.append(load_notes(str(mp)))
-                        except Exception:
-                            pass
+                            key_path = str(mp)
+                            if key_path not in generated_note_cache:
+                                generated_note_cache[key_path] = load_notes(key_path)
+                            _melody, accompaniment = split_skyline(
+                                generated_note_cache[key_path]
+                            )
+                            gen_notes_list.append(accompaniment)
+                        except Exception as exc:
+                            print(f"  Could not load generated file {mp}: {exc}")
                 if not gen_notes_list:
                     continue
                 dists = compute_jsd_wasserstein(gen_notes_list, real_notes_list)
@@ -486,9 +519,11 @@ def main(config_path: str) -> None:
         corpus_notes_list = []
         for _, rrow in manifest[manifest["split"] == "train"].iterrows():
             try:
-                corpus_notes_list.append(load_notes(rrow["midi_path"]))
-            except Exception:
-                pass
+                notes = load_window_notes(rrow, performance_cache)
+                _melody, accompaniment = split_skyline(notes)
+                corpus_notes_list.append(accompaniment)
+            except Exception as exc:
+                print(f"  Could not load train window {rrow['window_id']}: {exc}")
         if corpus_notes_list:
             print(f"  Building corpus n-gram index ({len(corpus_notes_list)} windows)...")
             corpus_index = build_corpus_ngram_index(corpus_notes_list, n=8)
@@ -500,11 +535,18 @@ def main(config_path: str) -> None:
                 if not mp.exists():
                     continue
                 try:
-                    gen_notes = load_notes(str(mp))
-                    m = longest_match_against_index(gen_notes, corpus_index)
+                    key_path = str(mp)
+                    if key_path not in generated_note_cache:
+                        generated_note_cache[key_path] = load_notes(key_path)
+                    _melody, gen_accompaniment = split_skyline(
+                        generated_note_cache[key_path]
+                    )
+                    m = longest_match_against_index(
+                        gen_accompaniment, corpus_index
+                    )
                     matches.append(m)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    print(f"  Could not check memorization for {mp}: {exc}")
             if matches:
                 mem_results = {
                     "max_shared_ngram": int(max(matches)),

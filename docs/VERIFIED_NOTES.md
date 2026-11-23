@@ -5,6 +5,16 @@ These notes will be updated once the library is cloned and its source read on Co
 
 ## Items to verify (all UNVERIFIED until run on Colab)
 
+### Melody/accompaniment separation
+- Generated-file metrics use the saved input melody and one-to-one onset matching
+  within 25 ms.
+- Real MAESTRO windows have no separate melody reference track, so classifier
+  training and real-vs-generated distance/memorization comparisons remove the
+  skyline melody and retain the remaining notes as accompaniment.
+- **UNVERIFIED**: the skyline heuristic's quality on the full MAESTRO windows;
+  inspect its output on representative excerpts before treating the metrics as
+  musically definitive.
+
 ### CONTROL_OFFSET
 - **UNVERIFIED**: The integer value of `CONTROL_OFFSET` in `anticipation/config.py`.
 - Expected: a large integer added to pitch/duration tokens to mark them as control tokens.

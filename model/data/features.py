@@ -45,6 +45,27 @@ def notes_from_pretty_midi(pm, exclude_drums: bool = True) -> list[Note]:
     return sorted(notes, key=lambda n: n.start)
 
 
+def split_skyline(notes: list[Note]) -> tuple[list[Note], list[Note]]:
+    """Return skyline melody notes and the remaining accompaniment notes."""
+    from model.data.skyline import Note as SkylineNote, skyline
+
+    skyline_notes = skyline([
+        SkylineNote(note.start, note.end, note.pitch) for note in notes
+    ])
+    melody_keys = {
+        (note.start, note.end, note.pitch) for note in skyline_notes
+    }
+    melody = [
+        note for note in notes
+        if (note.start, note.end, note.pitch) in melody_keys
+    ]
+    accompaniment = [
+        note for note in notes
+        if (note.start, note.end, note.pitch) not in melody_keys
+    ]
+    return melody, accompaniment
+
+
 # ---------------------------------------------------------------------------
 # Block 1: Key-invariant harmony
 # ---------------------------------------------------------------------------
