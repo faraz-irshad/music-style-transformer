@@ -15,7 +15,7 @@ The accurate claim for this work is: **Style-Conditioned Piano Accompaniment Gen
 
 ## 2. Related Work
 
-**Anticipatory Music Transformer (AMT)** [Thickstun et al., 2023]: A GPT-2-scale autoregressive model (~360M parameters) pretrained on **Lakh MIDI** (not MAESTRO). It uses a strict 3-token event grammar (arrival time, duration, pitch) and supports hard melodic constraints via control tokens (pitch + CONTROL_OFFSET). This is the backbone of our system.
+**Anticipatory Music Transformer (AMT)** [Thickstun et al., 2023]: A GPT-2-scale autoregressive, multi-instrument model (~360M parameters) pretrained on **Lakh MIDI**, not MAESTRO. It uses a strict 3-token event grammar (arrival time, duration, pitch) and supports hard melodic constraints via control tokens (pitch + CONTROL_OFFSET). This is the backbone of our system.
 
 **Groove2Groove** [Cífka et al., 2020]: Style transfer for accompaniment by disentangling content and style in a VAE. Operates on symbolic music; requires paired data. This is true style transfer (restyling an existing arrangement), which our work does not attempt.
 
@@ -35,7 +35,7 @@ The accurate claim for this work is: **Style-Conditioned Piano Accompaniment Gen
 
 | Label | Description |
 |-------|-------------|
-| `base_amt` | Pretrained AMT, melody as controls, no style conditioning. Neutral baseline. |
+| `base_amt` | Multi-instrument AMT pretrained on Lakh MIDI (not MAESTRO), melody as controls, no style conditioning. Neutral baseline. |
 | `layer_a_scripted` | Rule-based generator. NOT a learned model. Its contrast must be reported from measured classifier probabilities and feature differences, not inferred from the coded constants. |
 | `layer_c_lora` | Base AMT + LoRA adapter (r=8, alpha=16) trained on MAESTRO. |
 
@@ -119,7 +119,9 @@ Note: AMT was pretrained on Lakh MIDI, which contains scraped commercial songs. 
 
 ## 6. Results
 
-**[All numbers to be filled after Colab runs. No invented figures.]**
+Classifier and evaluation results remain to be filled after Colab runs. The
+sampling measurements below were reported from a prior Colab run and have not
+been independently reproduced against this commit.
 
 ### 6.1 Classifier Accuracy
 
@@ -147,6 +149,27 @@ Note: AMT was pretrained on Lakh MIDI, which contains scraped commercial songs. 
 |-------|-----------|------------|
 | baroque | — | — |
 | romantic | — | — |
+
+### 6.4 Sampling Constraints and Observed Output
+
+The reported Colab measurement for unconstrained base AMT generation was 0–21
+generated event groups per 15-second clip. It sometimes emitted non-piano
+programs (including 8, 11, 35, and 69) and stopped before the window end after
+sampling an event beyond `end_time`. With piano-only and maximum-time-gap
+constraints enabled, the reported base output was 29–72 groups per clip, all
+on instrument 0, and generation ran to the end of the window.
+
+| Sampling condition | Generated groups per 15-second clip | Instruments observed | Window completion |
+|--------------------|--------------------------------------|----------------------|-------------------|
+| Unconstrained base AMT | 0–21 | Non-piano programs included 8, 11, 35, and 69 | Sometimes ended early |
+| Piano and maximum-gap constraints | 29–72 | Instrument 0 only | Reached window end |
+
+The same piano-only and maximum-gap constraints are applied to every sampled
+AMT system (`base_amt` and `layer_c_lora`) so their comparison uses equivalent
+sampling conditions. `layer_a_scripted` is deterministic and does not sample
+from AMT, so it is not part of this sampling-constraint comparison. These
+measurements describe the reported Colab run, not a local verification of the
+current implementation.
 
 ---
 

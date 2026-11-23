@@ -6,6 +6,15 @@ Style-Conditioned Piano Accompaniment Generation — BSc Thesis, ELTE
 
 ---
 
+## Review round 3 (2026-11-23)
+
+| Item | Status | Notes |
+|------|--------|-------|
+| 1. Remove skyline melody from interleaved event stream | done; anticipation runtime UNVERIFIED | Interleaved samples tokenize accompaniment notes only; melody controls are retained. Empty accompaniment falls back to a plain sample. Cache suffix bumped to `_v4`. CPU test covers skyline exclusion and empty accompaniment. |
+| 2. Constrain AMT sampling and log accompaniment event groups | done; Colab/GPU/anticipation runtime UNVERIFIED | Piano-only and one-second maximum-gap wrappers are restored on context exit, including exceptions. Applied to `base_amt`, `layer_c_lora`, and the step-50 dominance check. Added `generated_groups` and a warning below 10. `nll_eval.py` does not sample. CPU stub test passes. |
+| 3. Stream notebook commands | done; Colab runtime UNVERIFIED | Training dry-run remains before full training; training and generation now use `!python -u`. Both notebooks still clone/refresh `fixes-and-ui` and print `HEAD`. Notebook JSON validates locally. |
+| 4. Sampling/model documentation | done | Records the supplied Colab measurement: unconstrained 0–21 groups, non-piano programs including 8/11/35/69, and early stops; constrained 29–72 groups, instrument 0, and completion of the window. The same sampling constraints are used for both sampled AMT systems for a fair comparison. The base is multi-instrument AMT pretrained on Lakh MIDI, not MAESTRO. Measurements are not independently reproduced on this commit. |
+
 ## Review round 2 (2026-11-23)
 
 | Item | Status | Notes |
