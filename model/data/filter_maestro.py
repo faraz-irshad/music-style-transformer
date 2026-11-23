@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse, json, os, random
 from pathlib import Path
 from typing import Optional
+import zlib
 
 import numpy as np
 import pandas as pd
@@ -93,17 +94,29 @@ def cut_windows(
     midi_dir: str,
     window_sec: float,
     max_windows: int,
+    seed: int = 42,
 ) -> list[dict]:
     """
-    Cut a performance into non-overlapping windows.
+    Sample non-overlapping windows across the full performance.
     Returns list of dicts with window metadata (no actual MIDI slicing here;
     slicing happens at training time using start_sec / end_sec).
     """
     midi_path = os.path.join(midi_dir, row["midi_filename"])
     duration = float(row["duration"])
-    n = min(max_windows, int(duration // window_sec))
+    available = int(duration // window_sec)
+    n = min(max_windows, available)
+    if n == 0:
+        return []
+    path_seed = seed ^ zlib.crc32(midi_path.encode("utf-8"))
+    rng = random.Random(path_seed)
+    positions = []
+    for bucket in range(n):
+        bucket_start = bucket * available // n
+        bucket_end = (bucket + 1) * available // n
+        positions.append(rng.randrange(bucket_start, bucket_end))
+    positions.sort()
     windows = []
-    for i in range(n):
+    for i in positions:
         windows.append({
             "midi_path": midi_path,
             "start_sec": i * window_sec,
@@ -144,7 +157,10 @@ def main(config_path: str) -> None:
     all_windows = []
     for _, row in df.iterrows():
         all_windows.extend(
-            cut_windows(row, midi_dir, dcfg["window_sec"], dcfg["max_windows_per_perf"])
+            cut_windows(
+                row, midi_dir, dcfg["window_sec"],
+                dcfg["max_windows_per_perf"], seed,
+            )
         )
 
     manifest = pd.DataFrame(all_windows)

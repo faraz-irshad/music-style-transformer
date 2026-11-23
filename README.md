@@ -64,6 +64,9 @@ python tests/test_train_lora.py
 python data/filter_maestro.py --config config.yaml
 python data/build_test_melodies.py --config config.yaml
 ```
+The MAESTRO manifest samples up to `max_windows_per_perf` non-overlapping
+windows across each full performance, stratified across its duration and
+seeded by `data.random_seed` (rather than always taking the opening windows).
 
 ### Classifier training (needs manifest.csv)
 ```bash
