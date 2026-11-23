@@ -369,6 +369,9 @@ def train(
 
     # Load model
     base = load_base_model(cfg["model"]["name"], device)
+    for module in base.modules():  # base model was not trained with dropout
+        if isinstance(module, torch.nn.Dropout):
+            module.p = 0.0
     base.enable_input_require_grads()
     base.gradient_checkpointing_enable()
 
@@ -518,7 +521,7 @@ def train(
 
             log_entry: dict = {
                 "step": step,
-                "train_loss": float(accum_loss * grad_accum),
+                "train_loss": float(accum_loss),
                 "s_per_step": elapsed,
             }
             accum_loss = 0.0
