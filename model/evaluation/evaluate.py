@@ -38,16 +38,49 @@ def load_notes(midi_path: str) -> list:
 
 
 def split_by_known_melody(
-    all_notes: list, melody_notes: list
-) -> tuple[list, list]:
+    all_notes: list,
+    melody_notes: list,
+    tolerance_sec: float = 0.025,
+) -> tuple[list, list, float]:
     """
-    Split notes into melody and accompaniment using the KNOWN input melody
-    (not a skyline of the output, which misclassifies arpeggios above the tune).
+    Match output melody notes one-to-one by pitch and onset within a tolerance.
     """
-    mel_set = {(round(n.start, 4), n.pitch) for n in melody_notes}
-    melody = [n for n in all_notes if (round(n.start, 4), n.pitch) in mel_set]
-    accompaniment = [n for n in all_notes if (round(n.start, 4), n.pitch) not in mel_set]
-    return melody, accompaniment
+    outputs_by_pitch: dict[int, list[tuple[int, object]]] = {}
+    for idx, note in sorted(
+        enumerate(all_notes), key=lambda item: item[1].start
+    ):
+        outputs_by_pitch.setdefault(note.pitch, []).append((idx, note))
+    melody_by_pitch: dict[int, list] = {}
+    for note in sorted(melody_notes, key=lambda item: item.start):
+        melody_by_pitch.setdefault(note.pitch, []).append(note)
+
+    matched_indices: set[int] = set()
+    matched_melody = []
+    for pitch, targets in melody_by_pitch.items():
+        candidates = outputs_by_pitch.get(pitch, [])
+        candidate_idx = 0
+        for target in targets:
+            while (
+                candidate_idx < len(candidates)
+                and candidates[candidate_idx][1].start
+                < target.start - tolerance_sec - 1e-9
+            ):
+                candidate_idx += 1
+            if (
+                candidate_idx < len(candidates)
+                and candidates[candidate_idx][1].start
+                <= target.start + tolerance_sec + 1e-9
+            ):
+                match_idx, match = candidates[candidate_idx]
+                matched_indices.add(match_idx)
+                matched_melody.append(match)
+                candidate_idx += 1
+
+    accompaniment = [
+        note for idx, note in enumerate(all_notes) if idx not in matched_indices
+    ]
+    fraction = len(matched_melody) / len(melody_notes) if melody_notes else float("nan")
+    return matched_melody, accompaniment, fraction
 
 
 # ---------------------------------------------------------------------------
@@ -265,19 +298,37 @@ def main(config_path: str) -> None:
             continue
 
         # Use known melody for separation (not skyline of output)
+        melody_found_fraction = float("nan")
         if melody_path.exists():
             melody_notes = load_notes(str(melody_path))
-            melody, accompaniment = split_by_known_melody(all_notes, melody_notes)
+            melody, accompaniment, melody_found_fraction = split_by_known_melody(
+                all_notes, melody_notes
+            )
+            match_below_threshold = (
+                melody_found_fraction < 0.8
+                if np.isfinite(melody_found_fraction) else None
+            )
+            if np.isfinite(melody_found_fraction):
+                print(
+                    f"  {stem}: melody notes found "
+                    f"{melody_found_fraction:.1%}"
+                    f"{' — BELOW 80%' if match_below_threshold else ''}"
+                )
+            else:
+                print(f"  {stem}: melody match unavailable (empty reference)")
         else:
             from model.data.skyline import skyline, Note as SNote
             snotes = [SNote(n.start, n.end, n.pitch) for n in all_notes]
             mel = skyline(snotes)
-            mel_set = {(n.start, n.pitch) for n in mel}
-            melody = [n for n in all_notes if (n.start, n.pitch) in mel_set]
-            accompaniment = [n for n in all_notes if (n.start, n.pitch) not in mel_set]
-
-        if not accompaniment:
-            accompaniment = all_notes
+            mel_set = {(n.start, n.end, n.pitch) for n in mel}
+            melody = [
+                n for n in all_notes if (n.start, n.end, n.pitch) in mel_set
+            ]
+            accompaniment = [
+                n for n in all_notes if (n.start, n.end, n.pitch) not in mel_set
+            ]
+            match_below_threshold = None
+            print(f"  {stem}: melody reference missing; skyline fallback used")
 
         feats = extract_all(accompaniment, melody_notes=melody, block="all")
         clf_pred_idx = clf.predict([feats])[0]
@@ -299,16 +350,35 @@ def main(config_path: str) -> None:
             "clf_prob_baroque": float(clf_prob[baroque_idx]),
             "clf_prob_romantic": float(clf_prob[romantic_idx]),
             "clf_correct": clf_correct,
+            "melody_found_fraction": melody_found_fraction,
+            "melody_match_below_80": match_below_threshold,
             "pc_entropy": pitch_class_entropy(accompaniment),
             "fourgram_rep": fourgram_repetition_rate(accompaniment),
-            "skyline_dom": skyline_dominance(melody, accompaniment) if melody else 1.0,
-            "clash_rate": melody_clash_rate(melody, accompaniment) if melody else 0.0,
+            "skyline_dom": (
+                skyline_dominance(melody, accompaniment)
+                if np.isfinite(melody_found_fraction) and melody_found_fraction >= 0.8
+                else np.nan
+            ),
+            "clash_rate": (
+                melody_clash_rate(melody, accompaniment)
+                if np.isfinite(melody_found_fraction) and melody_found_fraction >= 0.8
+                else np.nan
+            ),
         }
         rows.append(row)
 
     df = pd.DataFrame(rows)
     df.to_csv(results_dir / "evaluation_results.csv", index=False)
     print(f"Saved {len(df)} rows to {results_dir}/evaluation_results.csv")
+    available_matches = df["melody_found_fraction"].dropna()
+    if len(available_matches):
+        flagged = int((available_matches < 0.8).sum())
+        print(
+            f"Melody matching summary: mean={available_matches.mean():.1%}, "
+            f"below 80%={flagged}/{len(available_matches)}"
+        )
+    else:
+        print("Melody matching summary: no known melody references available")
 
     # ------------------------------------------------------------------
     # Per-layer accuracy (only for layers with a style label)

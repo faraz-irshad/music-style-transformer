@@ -14,6 +14,7 @@ Style-Conditioned Piano Accompaniment Generation — BSc Thesis, ELTE
 | 2. Training shuffle and transposition | done | Seed-shuffle windows and each sample epoch; choose one random transposition from -3..+3 per training window instead of concatenating shifts -6..+6. |
 | 3. Cache parsing and training window cap | done | Parse each performance once per cache build, slice windows in memory, use per-cache signatures to avoid dry-run/full-run cache collisions, add a 600-window/style cap, and report a first-20-window time estimate (or actual time for smaller runs). |
 | 4. Optimizer-step timing | done | Time the complete gradient-accumulation interval through the optimizer update, synchronize CUDA around timing, and report dry-run peak GPU memory (or explicitly report unavailable on CPU). |
+| 5. Melody matching in evaluation | done | One-to-one pitch/onset matching at 25 ms, per-file fraction and below-80% flag, aggregate summary, and NaN skyline/clash metrics when matching is insufficient or unavailable. Added focused synthetic tests. |
 
 ## Part 1 — train_lora.py
 
