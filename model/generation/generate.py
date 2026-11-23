@@ -20,6 +20,7 @@ UNVERIFIED (require Colab run):
 """
 from __future__ import annotations
 import argparse, csv, sys
+from collections import Counter
 from pathlib import Path
 
 import torch
@@ -101,28 +102,30 @@ def _combine_and_slice(
     controls: list[int],
     duration: float,
 ) -> list[int]:
-    """
-    Merge generated events with controls using the anticipation library's
-    own combine routine, then slice to the generated window.
+    """Merge controls and generated events, then clip to the requested seconds."""
+    from anticipation import ops
 
-    UNVERIFIED: ops.combine / ops.clip signature.
-    Falls back to returning generated_events if the routine is not found.
-    """
-    try:
-        from anticipation import ops
-        combine_fn = getattr(ops, "combine", None) or getattr(ops, "merge", None)
-        if combine_fn is None:
-            print("  WARNING: anticipation.ops has no combine/merge — "
-                  "melody may be absent from output. UNVERIFIED.")
-            return generated_events
-        combined = combine_fn(generated_events, controls)
-        clip_fn = getattr(ops, "clip", None)
-        if clip_fn is not None:
-            return clip_fn(combined, 0, duration, seconds=True)
-        return combined
-    except Exception as e:
-        print(f"  WARNING: combine/slice failed ({e}), returning raw events")
-        return generated_events
+    combined = ops.combine(generated_events, controls)
+    clipped = ops.clip(combined, 0, duration, seconds=True)
+    generated_pairs = Counter(
+        (time, pitch)
+        for time, _duration, pitch in zip(
+            clipped[0::3], clipped[1::3], clipped[2::3]
+        )
+    )
+    melody_pairs = [
+        (time - ops.CONTROL_OFFSET, pitch - ops.CONTROL_OFFSET)
+        for time, _duration, pitch in zip(
+            controls[0::3], controls[1::3], controls[2::3]
+        )
+    ]
+    matched = 0
+    for pair in melody_pairs:
+        if generated_pairs[pair]:
+            matched += 1
+            generated_pairs[pair] -= 1
+    print(f"  clipped melody notes present: {matched}/{len(melody_pairs)}")
+    return clipped
 
 
 def generate_base_amt(

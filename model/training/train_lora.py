@@ -53,40 +53,24 @@ def _build_anticipatory_sequence(
     Build an anticipatory interleaved sequence using the anticipation library's
     own routine so the training format matches what generate() expects.
 
-    UNVERIFIED: The exact function name in the installed library.
-    We try anticipation.ops.anticipate() first, then fall back to manual
-    interleaving that matches the library's documented format.
-
-    The library interleaves control tokens (melody + CONTROL_OFFSET) with
-    event tokens in time order. Loss is masked (-100) on control tokens.
+    anticipation.ops.anticipate returns (interleaved_tokens,
+    unconsumed_controls). Controls are masked from the training loss.
 
     Returns (input_ids, labels).
     """
-    try:
-        # Try the library's own interleave routine
-        # UNVERIFIED: function name — read anticipation/ops.py to confirm
-        from anticipation import ops
-        if hasattr(ops, "anticipate"):
-            ctrl = [t + control_offset for t in mel_events]
-            interleaved = ops.anticipate(events, ctrl)
-            # Labels: -100 on control positions, event tokens elsewhere
-            labels = []
-            for tok in interleaved:
-                labels.append(-100 if tok >= control_offset else tok)
-            return interleaved, labels
-    except Exception:
-        pass
-
-    # Fallback: manual interleave in time order (3-token groups)
-    # AMT token grammar: each event = (time_bin, duration_bin, pitch)
-    # Control tokens have the same structure but pitch += CONTROL_OFFSET
-    # We interleave by inserting each control group before the matching event group.
-    # UNVERIFIED: this matches the library's exact interleave order.
+    from anticipation import ops
     ctrl_tokens = [t + control_offset for t in mel_events]
-    # Simple prepend: controls first, then events (matches library's anticipatory mode)
-    combined = ctrl_tokens + events
-    labels = [-100] * len(ctrl_tokens) + list(events)
-    return combined, labels
+    interleaved, _unconsumed_controls = ops.anticipate(events, ctrl_tokens)
+    if len(interleaved) % 3:
+        raise ValueError(
+            f"anticipation.ops.anticipate returned {len(interleaved)} tokens; "
+            "expected complete 3-token events"
+        )
+    labels = [
+        -100 if token >= control_offset else token
+        for token in interleaved
+    ]
+    return list(interleaved), labels
 
 
 def _tokenise_window(
