@@ -95,7 +95,7 @@ def test_old_bug_would_step_every_iteration():
 
 
 def test_anticipatory_sample_events_exclude_skyline(monkeypatch):
-    """Interleaved samples contain the skyline only as controls, not events."""
+    """Samples include their generation prefix and align event groups."""
     import importlib
     import random
     import sys
@@ -117,11 +117,16 @@ def test_anticipatory_sample_events_exclude_skyline(monkeypatch):
 
     train_lora = importlib.import_module("model.training.train_lora")
     anticipation = types.ModuleType("anticipation")
+    anticipation.__path__ = []
     convert = types.ModuleType("anticipation.convert")
+    vocab = types.ModuleType("anticipation.vocab")
+    vocab.ANTICIPATE = 9001
+    vocab.AUTOREGRESS = 9002
     ops = types.SimpleNamespace()
     written_notes = {}
     event_streams = []
     anticipation.ops = ops
+    anticipation.vocab = vocab
 
     def write_notes(notes, path):
         written_notes[path] = list(notes)
@@ -145,6 +150,7 @@ def test_anticipatory_sample_events_exclude_skyline(monkeypatch):
     ops.anticipate = anticipate
     monkeypatch.setitem(sys.modules, "anticipation", anticipation)
     monkeypatch.setitem(sys.modules, "anticipation.convert", convert)
+    monkeypatch.setitem(sys.modules, "anticipation.vocab", vocab)
     monkeypatch.setattr(
         importlib.import_module("model.amt_utils"),
         "write_notes_to_midi",
@@ -156,23 +162,39 @@ def test_anticipatory_sample_events_exclude_skyline(monkeypatch):
         (0.0, 1.0, 60), (0.0, 1.0, 72),
         (1.0, 2.0, 64), (1.0, 2.0, 67),
     ]
-    ids, _, _ = train_lora._tokenise_window(
+    ids, labels, mask = train_lora._tokenise_window(
         row, 10000, 30, anticipatory_prob=1.0,
         rng=random.Random(0), performance_notes=notes,
     )
     event_pairs = set(zip(event_streams[0][0::3], event_streams[0][2::3]))
     skyline_pairs = {(0, 72), (1000, 67)}
     assert event_pairs.isdisjoint(skyline_pairs)
-    assert ids[:3] == event_streams[0][:3]
+    assert ids[0] == vocab.ANTICIPATE
+    assert labels[0] == -100
+    assert mask[0] == 1
+    interleaved_length = sum(mask)
+    assert (interleaved_length - 1) % 3 == 0
+    assert ids[1:4] == event_streams[0][:3]
 
-    # A melody with no accompaniment remains a plain sample.
+    # Plain samples carry AUTOREGRESS and use the same event-group alignment.
+    plain_ids, plain_labels, plain_mask = train_lora._tokenise_window(
+        row, 10000, 30, anticipatory_prob=0.0,
+        rng=random.Random(0), performance_notes=notes,
+    )
+    assert plain_ids[0] == vocab.AUTOREGRESS
+    assert plain_labels[0] == -100
+    assert plain_mask[0] == 1
+    plain_length = sum(plain_mask)
+    assert (plain_length - 1) % 3 == 0
+
+    # A melody with no accompaniment falls back to a plain sample.
     plain_ids, plain_labels, _ = train_lora._tokenise_window(
         row, 10000, 30, anticipatory_prob=1.0,
         rng=random.Random(0), performance_notes=[(0.0, 1.0, 72)],
     )
     assert len(event_streams) == 1
-    assert plain_ids[:3] == [0, 1000, 72]
-    assert plain_labels[:3] == plain_ids[:3]
+    assert plain_ids[0] == vocab.AUTOREGRESS
+    assert plain_labels[0] == -100
 
 
 # ---------------------------------------------------------------------------

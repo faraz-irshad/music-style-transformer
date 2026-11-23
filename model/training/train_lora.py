@@ -89,6 +89,7 @@ def _tokenise_window(
     Never truncates inside a 3-token event group.
     """
     from anticipation.convert import midi_to_events
+    from anticipation.vocab import ANTICIPATE, AUTOREGRESS
     from model.data.skyline import skyline, Note as SNote
     from model.amt_utils import write_notes_to_midi
     import tempfile
@@ -107,9 +108,17 @@ def _tokenise_window(
         if note_start >= start and note_end <= end
     ]
 
+    use_anticipatory = rng.random() < anticipatory_prob
     if not all_notes:
-        pad = [0] * seq_len
-        return pad, [-100] * seq_len, [0] * seq_len
+        flag = ANTICIPATE if use_anticipatory else AUTOREGRESS
+        ids = [flag]
+        labels = [-100]
+        pad_len = seq_len - 1
+        return (
+            ids + [0] * pad_len,
+            labels + [-100] * pad_len,
+            [1] + [0] * pad_len,
+        )
 
     tmp = tempfile.NamedTemporaryFile(suffix=".mid", delete=False)
     tmp.close()
@@ -119,7 +128,6 @@ def _tokenise_window(
     finally:
         os.unlink(tmp.name)
 
-    use_anticipatory = rng.random() < anticipatory_prob
     if use_anticipatory:
         mel = skyline(all_notes)
         melody_keys = {(round(note.start, 3), note.pitch) for note in mel}
@@ -146,17 +154,20 @@ def _tokenise_window(
             ids, labels = _build_anticipatory_sequence(
                 accompaniment_events, mel_events, control_offset
             )
+            flag = ANTICIPATE
         else:
             ids = list(events)
             labels = list(events)
+            flag = AUTOREGRESS
     else:
         ids = list(events)
         labels = list(events)
+        flag = AUTOREGRESS
 
-    # Truncate to seq_len, but never inside a 3-token group
-    max_tokens = (seq_len // 3) * 3
-    ids = ids[:max_tokens]
-    labels = labels[:max_tokens]
+    # Keep the flag followed by complete 3-token event groups.
+    max_event_tokens = ((seq_len - 1) // 3) * 3
+    ids = [flag] + ids[:max_event_tokens]
+    labels = [-100] + labels[:max_event_tokens]
 
     # Pad
     pad_len = seq_len - len(ids)
@@ -201,7 +212,7 @@ def _cache_path(
     ]
     payload = repr((style, split, seed, control_offset, seq_len, signature))
     digest = hashlib.sha256(payload.encode()).hexdigest()[:16]
-    return cache_dir / f"{style}_{split}_{digest}_v4.pkl"
+    return cache_dir / f"{style}_{split}_{digest}_v5.pkl"
 
 
 def build_cache(

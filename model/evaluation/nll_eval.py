@@ -83,6 +83,8 @@ def score_windows(
     scores = []
     for row in windows:
         try:
+            # Share the training tokenization format, including its AUTOREGRESS
+            # prefix and masked prefix label, for comparable teacher-forced NLL.
             ids, lbls, mask = _tokenise_window(
                 row, control_offset, seq_len,
                 anticipatory_prob=0.0, rng=rng, shift=0
