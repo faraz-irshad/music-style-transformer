@@ -1,0 +1,10 @@
+{
+  "melodies": [],
+  "summary": {},
+  "layers": [
+    {"id": "base_amt", "label": "Pretrained AMT"},
+    {"id": "layer_a_scripted", "label": "Scripted \u2014 not a learned model"},
+    {"id": "layer_c_lora", "label": "Learned \u2014 LoRA adapter"}
+  ],
+  "_empty": true
+}
