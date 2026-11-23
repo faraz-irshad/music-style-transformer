@@ -108,7 +108,7 @@ def mean_scores(scores: list[dict[str, float]]) -> dict[str, float]:
 
 def main(config_path: str) -> None:
     import pandas as pd
-    import anticipation.config as acfg
+    import anticipation.vocab as acfg
     from model.training.train_lora import load_windows, load_clean_base
 
     with open(config_path) as f:

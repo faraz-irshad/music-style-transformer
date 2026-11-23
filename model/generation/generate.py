@@ -238,7 +238,7 @@ class GenerationLog:
 # ---------------------------------------------------------------------------
 
 def main(config_path: str) -> None:
-    import anticipation.config as acfg
+    import anticipation.vocab as acfg
 
     with open(config_path) as f:
         cfg = yaml.safe_load(f)

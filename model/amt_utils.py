@@ -5,7 +5,7 @@ Shared helpers for the Anticipatory Music Transformer pipeline.
 Used by train_lora.py and generate.py.
 
 UNVERIFIED items (require Colab run to confirm):
-  - CONTROL_OFFSET exact value (read from anticipation.config at runtime)
+  - CONTROL_OFFSET exact value (read from anticipation.vocab at runtime)
   - anticipation.ops interleave routine name and signature
   - events_to_midi return type (mido.MidiFile vs pretty_midi.PrettyMIDI)
 """

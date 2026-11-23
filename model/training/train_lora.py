@@ -328,7 +328,7 @@ def train(
 ) -> None:
     import random
     from peft import LoraConfig, get_peft_model
-    import anticipation.config as acfg
+    import anticipation.vocab as acfg
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
