@@ -21,22 +21,25 @@ Every output file is labeled with its provenance. The labels are:
 
 ## Repository layout
 
+The project follows an MVC-oriented layout:
+
+- `model/` — data processing, music-domain logic, generators, training, and evaluation.
+- `controller/` — CLI and demo-index orchestration entry points.
+- `view/` — React/Vite presentation of generated results.
+
+Legacy root command names remain as compatibility entry points.
+
 ```
-amt_utils.py        Shared tokenisation helpers (used by train_lora.py and generate.py)
-colab/              Colab notebooks and setup scripts
-data/               Data cleaning, splitting, skyline extraction, feature extraction
-layer_a/            Rule-based accompaniment generator (dependency-free)
-tests/              Unit tests (run on CPU, no GPU required)
-docs/               Verified notes, report draft
-results/            CSV/JSON metrics, PNG figures, MIDI/WAV outputs (gitignored)
-scripts/            Utility scripts (demo index builder)
-view/               Results browser UI (React/Vite/TypeScript/Mantine)
-config.yaml         Paths and hyperparameters
-train_lora.py       LoRA fine-tuning (Colab GPU)
-generate.py         Generation pipeline (Colab GPU)
-train_classifier.py Style classifier training
-evaluate.py         Evaluation metrics and statistical tests
-nll_eval.py         Cross-style NLL matrix (Colab GPU)
+model/               Domain model: data, features, generators, training, and evaluation
+controller/          CLI orchestration and demo-index controller
+view/                Results browser UI (React/Vite/TypeScript/Mantine)
+colab/               Colab notebooks and setup scripts
+tests/               Unit tests (run on CPU, no GPU required)
+docs/                Verified notes, report draft
+results/             CSV/JSON metrics, PNG figures, MIDI/WAV outputs (gitignored)
+scripts/             Compatibility entry points
+config.yaml          Paths and hyperparameters
+*.py at the root     Compatibility entry points for existing commands
 ```
 
 ## Licensing
