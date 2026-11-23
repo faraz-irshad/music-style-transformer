@@ -166,31 +166,21 @@ def generate_layer_a(
 
 
 def generate_layer_c(
-    adapter_path: str,
-    model_name: str,
+    model,
     melody_notes: list[tuple[float, float, int]],
     control_offset: int,
     duration: float,
     top_p: float,
     seed: int,
-    device: str,
 ) -> list[int]:
-    """
-    Layer C: load a FRESH base model, wrap with LoRA adapter, generate, discard.
-    Never reuses a base model object after wrapping.
-    """
-    from peft import PeftModel
+    """Generate Layer C output with a style adapter loaded by the caller."""
     from anticipation.sample import generate
-    fresh_base = load_clean_base(model_name, device)
-    model = PeftModel.from_pretrained(fresh_base, adapter_path)
-    model.eval()
     controls = _melody_to_controls(melody_notes, control_offset)
     torch.manual_seed(seed)
     with torch.no_grad():
         output = generate(model, start_time=0, end_time=duration,
                           inputs=[], controls=controls, top_p=top_p)
     result = _combine_and_slice(output, controls, duration)
-    del model, fresh_base
     return result
 
 
@@ -339,6 +329,9 @@ def main(config_path: str) -> None:
     # ------------------------------------------------------------------
     print("\n=== Pass 3: layer_c_lora ===")
     for style in STYLES:
+        import gc
+        from peft import PeftModel
+
         adapter_path = str(Path(drive_dir) / f"adapter_{style}" / "final")
         if not Path(adapter_path).exists():
             print(f"  adapter_{style}: NOT FOUND at {adapter_path} — skipping")
@@ -348,30 +341,59 @@ def main(config_path: str) -> None:
                            style=style, seed=seed, adapter=adapter_path,
                            duration=duration, status="skipped",
                            error="adapter not found")
+            gc.collect()
+            if device == "cuda":
+                torch.cuda.empty_cache()
             continue
 
-        for mel_path in melody_files:
-            mel_id = mel_path.stem
-            melody_notes = load_melody_notes(str(mel_path))
-            stem = f"layer_c_lora_{mel_id}_{style}"
-            try:
-                events = generate_layer_c(
-                    adapter_path, model_name, melody_notes,
-                    control_offset, duration, top_p, seed, device
+        fresh_base = None
+        layer_c_model = None
+        try:
+            fresh_base = load_clean_base(model_name, device)
+            layer_c_model = PeftModel.from_pretrained(fresh_base, adapter_path)
+            layer_c_model.eval()
+        except Exception as e:
+            for mel_path in melody_files:
+                log.record(
+                    file=f"layer_c_lora_{mel_path.stem}_{style}",
+                    layer="layer_c_lora",
+                    melody_id=mel_path.stem,
+                    style=style,
+                    seed=seed,
+                    adapter=adapter_path,
+                    duration=duration,
+                    status="failed",
+                    error=f"Could not load style adapter: {e}",
                 )
-                pm = events_to_pm(events)
-                save_midi(pm, str(midi_dir / f"{stem}.mid"))
-                if do_render_wav(pm, str(wav_dir / f"{stem}.wav")):
-                    n_wav += 1
-                log.record(file=stem, layer="layer_c_lora", melody_id=mel_id,
-                           style=style, seed=seed, adapter=adapter_path,
-                           duration=duration, status="ok")
-                print(f"  {stem}: ok")
-            except Exception as e:
-                log.record(file=stem, layer="layer_c_lora", melody_id=mel_id,
-                           style=style, seed=seed, adapter=adapter_path,
-                           duration=duration, status="failed", error=str(e))
-                print(f"  {stem}: FAILED — {e}")
+            print(f"  adapter_{style}: FAILED to load — {e}")
+        else:
+            for mel_path in melody_files:
+                mel_id = mel_path.stem
+                melody_notes = load_melody_notes(str(mel_path))
+                stem = f"layer_c_lora_{mel_id}_{style}"
+                try:
+                    events = generate_layer_c(
+                        layer_c_model, melody_notes, control_offset,
+                        duration, top_p, seed
+                    )
+                    pm = events_to_pm(events)
+                    save_midi(pm, str(midi_dir / f"{stem}.mid"))
+                    if do_render_wav(pm, str(wav_dir / f"{stem}.wav")):
+                        n_wav += 1
+                    log.record(file=stem, layer="layer_c_lora", melody_id=mel_id,
+                               style=style, seed=seed, adapter=adapter_path,
+                               duration=duration, status="ok")
+                    print(f"  {stem}: ok")
+                except Exception as e:
+                    log.record(file=stem, layer="layer_c_lora", melody_id=mel_id,
+                               style=style, seed=seed, adapter=adapter_path,
+                               duration=duration, status="failed", error=str(e))
+                    print(f"  {stem}: FAILED — {e}")
+        finally:
+            del layer_c_model, fresh_base
+            gc.collect()
+            if device == "cuda":
+                torch.cuda.empty_cache()
 
     # ------------------------------------------------------------------
     # Summary

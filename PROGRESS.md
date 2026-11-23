@@ -16,6 +16,7 @@ Style-Conditioned Piano Accompaniment Generation — BSc Thesis, ELTE
 | 4. Optimizer-step timing | done | Time the complete gradient-accumulation interval through the optimizer update, synchronize CUDA around timing, and report dry-run peak GPU memory (or explicitly report unavailable on CPU). |
 | 5. Melody matching in evaluation | done | One-to-one pitch/onset matching at 25 ms, per-file fraction and below-80% flag, aggregate summary, and NaN skyline/clash metrics when matching is insufficient or unavailable. Added focused synthetic tests. |
 | 6. Windowed accompaniment metrics and classifier | done | Parse performance MIDI once per path, slice manifest windows, use skyline removal for real-window classifier/distance/memorization features and for distribution/memorization comparisons, and document why real MAESTRO requires the skyline heuristic. |
+| 7. Layer C adapter lifetime | done | Load one fresh base plus one adapter for each style, reuse for that style's melodies, and collect/clear GPU cache after the style. Base generation remains a separate first pass before PEFT wrapping. |
 
 ## Part 1 — train_lora.py
 
