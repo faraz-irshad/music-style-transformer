@@ -33,6 +33,7 @@ training:
 
 generation:
   top_p: 0.95
+  # max_new_tokens: not currently used by generate.py (end_time controls length)
   max_new_tokens: 1024
   random_seed: 42
   n_test_melodies: 30

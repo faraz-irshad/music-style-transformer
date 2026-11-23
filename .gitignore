@@ -45,9 +45,11 @@ Thumbs.db
 .DS_Store
 
 # Python
-__pycache__
+__pycache__/
 *.py[cod]
 *$py.class
+*.pyc
+*.pyo
 *.so
 .Python
 env/
@@ -74,3 +76,12 @@ wheels/
 .mypy_cache/
 .dmypy.json
 dmypy.json
+
+# Results (large generated files)
+results/midi/
+results/wav/
+results/figures/
+results/*.pkl
+
+# Token cache
+*/token_cache/
