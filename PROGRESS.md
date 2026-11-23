@@ -10,7 +10,7 @@ Style-Conditioned Piano Accompaniment Generation — BSc Thesis, ELTE
 
 | Item | Status | Notes |
 |------|--------|-------|
-| 1. Anticipation interleave/combine/clip | in progress | GitHub `anticipation/ops.py` confirms `anticipate(events, controls, delta)` returns `(tokens, unconsumed_controls)`, `combine(events, controls)` returns tokens, and `clip(tokens, start, end, clip_duration=True, seconds=True)` accepts `seconds`. Removed silent fallbacks and added a Colab interleave/generate check. Runtime check remains UNVERIFIED until run on Colab. |
+| 1. Anticipation interleave/combine/clip | done; Colab runtime UNVERIFIED | GitHub `anticipation/ops.py` confirms `anticipate(events, controls, delta)` returns `(tokens, unconsumed_controls)`, `combine(events, controls)` returns tokens, and `clip(tokens, start, end, clip_duration=True, seconds=True)` accepts `seconds`. Removed silent fallbacks and added a Colab interleave/generate check. |
 | 2. Training shuffle and transposition | done | Seed-shuffle windows and each sample epoch; choose one random transposition from -3..+3 per training window instead of concatenating shifts -6..+6. |
 | 3. Cache parsing and training window cap | done | Parse each performance once per cache build, slice windows in memory, use per-cache signatures to avoid dry-run/full-run cache collisions, add a 600-window/style cap, and report a first-20-window time estimate (or actual time for smaller runs). |
 | 4. Optimizer-step timing | done | Time the complete gradient-accumulation interval through the optimizer update, synchronize CUDA around timing, and report dry-run peak GPU memory (or explicitly report unavailable on CPU). |
@@ -19,6 +19,8 @@ Style-Conditioned Piano Accompaniment Generation — BSc Thesis, ELTE
 | 7. Layer C adapter lifetime | done | Load one fresh base plus one adapter for each style, reuse for that style's melodies, and collect/clear GPU cache after the style. Base generation remains a separate first pass before PEFT wrapping. |
 | 8. Full-performance window sampling | done | Seeded stratified sampling selects non-overlapping windows across the entire performance; README documents that sampling is not limited to the opening. Added tests. |
 | 9. Layer A dependencies, harmony, and measurements | done; empirical output UNVERIFIED | Corrected dependency documentation, added I/IV/V/vi bar-level pitch-class weighting and a three-melody MIDI/classifier measurement script. `tests/test_layer_a.py` and `tests/test_skyline.py` pass with `mido` and `pretty_midi`. No classifier artifact is present in `results/`, so classifier probabilities/feature differences were not generated. |
+| 10. Colab branch pinning | done; notebook runtime UNVERIFIED | All three notebooks clone or refresh `fixes-and-ui`, checkout `origin/fixes-and-ui`, and print the exact `HEAD` hash. Notebook cells were not run in Colab. |
+| MVC CLI compatibility | done | Root and `controller/` entry points for generate/evaluate/classifier/NLL evaluation now parse `--config` before invoking the moved implementation. |
 
 ## Part 1 — train_lora.py
 
@@ -128,3 +130,39 @@ python nll_eval.py --config config.yaml   # Colab only
 python scripts/build_demo_index.py --config config.yaml
 cd view && npm install && npm run build
 ```
+
+## Review round 2 — Colab verification sequence
+
+These are verification steps, not results from this local run. First push the
+local `fixes-and-ui` commits from a machine with GitHub authentication. Then,
+in a fresh Colab runtime:
+
+```bash
+git clone -b fixes-and-ui --single-branch https://github.com/faraz-irshad/music-style-transformer.git /content/thesis
+cd /content/thesis
+git rev-parse HEAD
+python -c "exec(open('colab/setup_cell.py').read())"
+```
+
+Set the MAESTRO paths in `config.yaml` (or run the setup/config cells in
+`colab/05_train_lora.ipynb`), then run in order:
+
+```bash
+python data/filter_maestro.py --config config.yaml
+python data/build_test_melodies.py --config config.yaml
+python -m pytest tests/test_layer_a.py tests/test_skyline.py -q
+python train_lora.py --config config.yaml --style baroque --dry_run
+python train_lora.py --config config.yaml --style romantic --dry_run
+python train_lora.py --config config.yaml --style baroque
+python train_lora.py --config config.yaml --style romantic
+python generate.py --config config.yaml
+python train_classifier.py --config config.yaml
+python evaluate.py --config config.yaml
+python scripts/measure_layer_a.py
+python nll_eval.py --config config.yaml
+```
+
+The dry runs must print interleaving/generation checks, estimated/cache-build
+time, full optimizer-step seconds, and peak GPU memory. The measurement command
+must print classifier probabilities and feature differences; until it runs
+with the current classifier, those empirical Layer A results remain UNVERIFIED.
