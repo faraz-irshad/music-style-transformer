@@ -440,10 +440,15 @@ def train(
     micro_step = 0  # counts micro-batches since last optimizer step
     accum_loss = 0.0
 
-    if dry_run:
+    if dry_run and device == "cuda":
         torch.cuda.reset_peak_memory_stats()
 
     while step < max_steps:
+        if micro_step % grad_accum == 0:
+            if device == "cuda":
+                torch.cuda.synchronize()
+            optimizer_step_started = time.perf_counter()
+
         # Build micro-batch
         batch_ids, batch_labels, batch_mask = [], [], []
         for _ in range(micro_batch):
@@ -460,7 +465,6 @@ def train(
         lbl_t = torch.tensor(batch_labels, dtype=torch.long, device=device)
         mask_t = torch.tensor(batch_mask, dtype=torch.long, device=device)
 
-        t0 = time.time()
         with autocast():
             out = model(input_ids=ids_t, attention_mask=mask_t, labels=lbl_t)
             loss = out.loss / grad_accum
@@ -478,7 +482,9 @@ def train(
             scheduler.step()
             optimizer.zero_grad()
             step += 1
-            elapsed = time.time() - t0
+            if device == "cuda":
+                torch.cuda.synchronize()
+            elapsed = time.perf_counter() - optimizer_step_started
 
             log_entry: dict = {
                 "step": step,
@@ -488,10 +494,15 @@ def train(
             accum_loss = 0.0
 
             if dry_run:
-                peak_gb = torch.cuda.max_memory_allocated() / 1e9
-                log_entry["peak_gpu_gb"] = peak_gb
+                if device == "cuda":
+                    peak_gb = torch.cuda.max_memory_allocated() / 1e9
+                    log_entry["peak_gpu_gb"] = peak_gb
+                    memory_report = f"{peak_gb:.2f}GB"
+                else:
+                    memory_report = "UNAVAILABLE (CPU run)"
                 print(f"[dry_run] step {step}: loss={log_entry['train_loss']:.4f} "
-                      f"s/step={elapsed:.2f} peak_gpu={peak_gb:.2f}GB")
+                      f"s/optimizer_step={elapsed:.2f} "
+                      f"peak_gpu={memory_report}")
             else:
                 # Validation loss every 10 steps
                 if step % 10 == 0 and val_samples:
