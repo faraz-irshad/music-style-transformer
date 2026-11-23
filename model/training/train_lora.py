@@ -147,8 +147,8 @@ def _tokenise_window(
     return ids, labels, mask
 
 
-def _cache_path(cache_dir: Path, style: str, split: str, shift: int) -> Path:
-    return cache_dir / f"{style}_{split}_shift{shift:+d}.pkl"
+def _cache_path(cache_dir: Path, style: str, split: str, seed: int) -> Path:
+    return cache_dir / f"{style}_{split}_seed{seed}_v2.pkl"
 
 
 def build_cache(
@@ -160,37 +160,37 @@ def build_cache(
     cache_dir: Path,
     seed: int,
 ) -> None:
-    """Pre-tokenise all windows for all transposition shifts and cache to disk."""
+    """Pre-tokenise windows with one seeded random shift per training window."""
     import random
     cache_dir.mkdir(parents=True, exist_ok=True)
+    cp = _cache_path(cache_dir, style, split, seed)
+    if cp.exists():
+        return
     rng = random.Random(seed)
-    for shift in range(-6, 7):
-        cp = _cache_path(cache_dir, style, split, shift)
-        if cp.exists():
-            continue
-        print(f"  Caching {style}/{split} shift={shift:+d} ...")
-        samples = []
-        for row in windows:
-            ids, lbls, mask = _tokenise_window(
-                row, control_offset, seq_len,
-                anticipatory_prob=0.5 if split == "train" else 0.0,
-                rng=rng, shift=shift,
-            )
-            samples.append((ids, lbls, mask))
-        with open(cp, "wb") as f:
-            pickle.dump(samples, f)
+    shuffled_windows = list(windows)
+    rng.shuffle(shuffled_windows)
+    print(f"  Caching {style}/{split} ({len(shuffled_windows)} windows) ...")
+    samples = []
+    for row in shuffled_windows:
+        shift = rng.randint(-3, 3) if split == "train" else 0
+        ids, lbls, mask = _tokenise_window(
+            row, control_offset, seq_len,
+            anticipatory_prob=0.5 if split == "train" else 0.0,
+            rng=rng, shift=shift,
+        )
+        samples.append((ids, lbls, mask))
+    with open(cp, "wb") as f:
+        pickle.dump(samples, f)
     print(f"  Cache complete for {style}/{split}")
 
 
-def load_cached(cache_dir: Path, style: str, split: str) -> list[tuple]:
-    """Load all cached samples for a style/split (all shifts combined)."""
-    samples = []
-    for shift in range(-6, 7):
-        cp = _cache_path(cache_dir, style, split, shift)
-        if cp.exists():
-            with open(cp, "rb") as f:
-                samples.extend(pickle.load(f))
-    return samples
+def load_cached(
+    cache_dir: Path, style: str, split: str, seed: int
+) -> list[tuple]:
+    """Load cached samples for a style/split."""
+    cp = _cache_path(cache_dir, style, split, seed)
+    with open(cp, "rb") as f:
+        return pickle.load(f)
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +309,7 @@ def train(
     # Data
     train_windows = load_windows(manifest_path, style, "train")
     val_windows = load_windows(manifest_path, style, "val")
+    rng.shuffle(train_windows)
     n_train = 8 if dry_run else len(train_windows)
     train_windows = train_windows[:n_train]
     print(f"Train windows: {len(train_windows)}, Val windows: {len(val_windows)}")
@@ -318,8 +319,8 @@ def train(
     print("Building token cache (skips if already done)...")
     build_cache(train_windows, style, "train", control_offset, seq_len, cache_dir, seed)
     build_cache(val_windows[:8], style, "val", control_offset, seq_len, cache_dir, seed)
-    train_samples = load_cached(cache_dir, style, "train")
-    val_samples = load_cached(cache_dir, style, "val")
+    train_samples = load_cached(cache_dir, style, "train", seed)
+    val_samples = load_cached(cache_dir, style, "val", seed)
     print(f"Loaded {len(train_samples)} train samples, {len(val_samples)} val samples")
 
     # Optimizer
@@ -354,6 +355,8 @@ def train(
 
     model.train()
     optimizer.zero_grad()
+    sample_order = list(range(len(train_samples)))
+    rng.shuffle(sample_order)
     sample_idx = 0
     micro_step = 0  # counts micro-batches since last optimizer step
     accum_loss = 0.0
@@ -365,7 +368,10 @@ def train(
         # Build micro-batch
         batch_ids, batch_labels, batch_mask = [], [], []
         for _ in range(micro_batch):
-            ids, lbls, mask = train_samples[sample_idx % len(train_samples)]
+            if sample_idx == len(sample_order):
+                rng.shuffle(sample_order)
+                sample_idx = 0
+            ids, lbls, mask = train_samples[sample_order[sample_idx]]
             sample_idx += 1
             batch_ids.append(ids)
             batch_labels.append(lbls)
