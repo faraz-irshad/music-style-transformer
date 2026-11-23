@@ -58,13 +58,13 @@ Style-Conditioned Piano Accompaniment Generation — BSc Thesis, ELTE
 
 | ID | Task | Status | Notes |
 |----|------|--------|-------|
-| P5.cleanup | Find/prove unused items; delete only proven unused; update .gitignore | done | |
+| P5.cleanup | Find/prove unused items; delete only proven unused; update .gitignore | done | see CLEANUP.md |
 
 ## Part 6 — UI
 
 | ID | Task | Status | Notes |
 |----|------|--------|-------|
-| P6.ui | Replace mock UI with honest results browser | done | |
+| P6.ui | Replace mock UI with honest results browser | done | npm run build passes |
 
 ---
 
