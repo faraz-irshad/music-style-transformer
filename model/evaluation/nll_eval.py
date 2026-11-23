@@ -111,7 +111,9 @@ def mean_scores(scores: list[dict[str, float]]) -> dict[str, float]:
 def main(config_path: str) -> None:
     import pandas as pd
     import anticipation.vocab as acfg
-    from model.training.train_lora import load_windows, load_clean_base
+    import random
+    from model.training.train_lora import load_windows
+    from model.generation.generate import load_clean_base
 
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
@@ -127,8 +129,11 @@ def main(config_path: str) -> None:
     control_offset = acfg.CONTROL_OFFSET
 
     # Load test windows
-    baroque_test = load_windows(manifest_path, "baroque", "test")[:20]
-    romantic_test = load_windows(manifest_path, "romantic", "test")[:20]
+    rng = random.Random(42)
+    baroque_windows = load_windows(manifest_path, "baroque", "test")
+    romantic_windows = load_windows(manifest_path, "romantic", "test")
+    baroque_test = rng.sample(baroque_windows, min(20, len(baroque_windows)))
+    romantic_test = rng.sample(romantic_windows, min(20, len(romantic_windows)))
     print(f"Baroque test: {len(baroque_test)}, Romantic test: {len(romantic_test)}")
 
     matrix = {}
