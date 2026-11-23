@@ -104,6 +104,7 @@ def _combine_and_slice(
 ) -> list[int]:
     """Merge controls and generated events, then clip to the requested seconds."""
     from anticipation import ops
+    from anticipation import vocab
 
     combined = ops.combine(generated_events, controls)
     clipped = ops.clip(combined, 0, duration, seconds=True)
@@ -114,7 +115,7 @@ def _combine_and_slice(
         )
     )
     melody_pairs = [
-        (time - ops.CONTROL_OFFSET, pitch - ops.CONTROL_OFFSET)
+        (time - vocab.CONTROL_OFFSET, pitch - vocab.CONTROL_OFFSET)
         for time, _duration, pitch in zip(
             controls[0::3], controls[1::3], controls[2::3]
         )
@@ -128,6 +129,49 @@ def _combine_and_slice(
     return clipped
 
 
+def _generated_group_count(
+    events: list[int],
+    melody_notes: list[tuple[float, float, int]],
+    control_offset: int,
+) -> int:
+    """Count event groups after subtracting the melody controls."""
+    controls = _melody_to_controls(melody_notes, control_offset)
+    remaining = Counter(
+        (time, pitch)
+        for time, _duration, pitch in zip(
+            events[0::3], events[1::3], events[2::3]
+        )
+    )
+    for time, _duration, pitch in zip(
+        controls[0::3], controls[1::3], controls[2::3]
+    ):
+        pair = (time - control_offset, pitch - control_offset)
+        if remaining[pair]:
+            remaining[pair] -= 1
+    return sum(remaining.values())
+
+
+def _layer_a_group_count(pm, melody_notes: list[tuple[float, float, int]]) -> int:
+    remaining = Counter(
+        (round(note.start, 3), note.pitch)
+        for instrument in pm.instruments
+        for note in instrument.notes
+    )
+    for start, _end, pitch in melody_notes:
+        pair = (round(start, 3), pitch)
+        if remaining[pair]:
+            remaining[pair] -= 1
+    return sum(remaining.values())
+
+
+def _warn_if_sparse(stem: str, generated_groups: int) -> None:
+    if generated_groups < 10:
+        print(
+            f"  WARNING: {stem} generated only {generated_groups} "
+            "accompaniment event groups (<10)"
+        )
+
+
 def generate_base_amt(
     model,
     melody_notes: list[tuple[float, float, int]],
@@ -138,12 +182,15 @@ def generate_base_amt(
 ) -> list[int]:
     """Base AMT: melody as controls, no style adapter. Generated ONCE per melody."""
     from anticipation.sample import generate
+    from model.generation.sampling import constrained_sampling
     _assert_no_lora(model, "base_amt")
     controls = _melody_to_controls(melody_notes, control_offset)
     torch.manual_seed(seed)
-    with torch.no_grad():
-        output = generate(model, start_time=0, end_time=duration,
-                          inputs=[], controls=controls, top_p=top_p)
+    with constrained_sampling(), torch.no_grad():
+        output = generate(
+            model, start_time=0, end_time=duration,
+            inputs=[], controls=controls, top_p=top_p
+        )
     return _combine_and_slice(output, controls, duration)
 
 
@@ -175,11 +222,14 @@ def generate_layer_c(
 ) -> list[int]:
     """Generate Layer C output with a style adapter loaded by the caller."""
     from anticipation.sample import generate
+    from model.generation.sampling import constrained_sampling
     controls = _melody_to_controls(melody_notes, control_offset)
     torch.manual_seed(seed)
-    with torch.no_grad():
-        output = generate(model, start_time=0, end_time=duration,
-                          inputs=[], controls=controls, top_p=top_p)
+    with constrained_sampling(), torch.no_grad():
+        output = generate(
+            model, start_time=0, end_time=duration,
+            inputs=[], controls=controls, top_p=top_p
+        )
     result = _combine_and_slice(output, controls, duration)
     return result
 
@@ -209,7 +259,7 @@ def do_render_wav(pm, path: str) -> bool:
 
 class GenerationLog:
     FIELDS = ["file", "layer", "melody_id", "style", "seed",
-              "adapter", "duration", "status", "error"]
+              "adapter", "duration", "generated_groups", "status", "error"]
 
     def __init__(self, path: str) -> None:
         self.path = path
@@ -288,9 +338,14 @@ def main(config_path: str) -> None:
             save_midi(pm, str(midi_dir / f"{stem}.mid"))
             if do_render_wav(pm, str(wav_dir / f"{stem}.wav")):
                 n_wav += 1
+            generated_groups = _generated_group_count(
+                events, melody_notes, control_offset
+            )
+            _warn_if_sparse(stem, generated_groups)
             log.record(file=stem, layer="base_amt", melody_id=mel_id,
                        style="none", seed=seed, adapter="none",
-                       duration=duration, status="ok")
+                       duration=duration, status="ok",
+                       generated_groups=generated_groups)
             print(f"  {stem}: ok")
         except Exception as e:
             log.record(file=stem, layer="base_amt", melody_id=mel_id,
@@ -314,9 +369,12 @@ def main(config_path: str) -> None:
                 save_midi(pm, str(midi_dir / f"{stem}.mid"))
                 if do_render_wav(pm, str(wav_dir / f"{stem}.wav")):
                     n_wav += 1
+                generated_groups = _layer_a_group_count(pm, melody_notes)
+                _warn_if_sparse(stem, generated_groups)
                 log.record(file=stem, layer="layer_a_scripted", melody_id=mel_id,
                            style=style, seed=seed, adapter="none",
-                           duration=duration, status="ok")
+                           duration=duration, status="ok",
+                           generated_groups=generated_groups)
                 print(f"  {stem}: ok")
             except Exception as e:
                 log.record(file=stem, layer="layer_a_scripted", melody_id=mel_id,
@@ -380,9 +438,14 @@ def main(config_path: str) -> None:
                     save_midi(pm, str(midi_dir / f"{stem}.mid"))
                     if do_render_wav(pm, str(wav_dir / f"{stem}.wav")):
                         n_wav += 1
+                    generated_groups = _generated_group_count(
+                        events, melody_notes, control_offset
+                    )
+                    _warn_if_sparse(stem, generated_groups)
                     log.record(file=stem, layer="layer_c_lora", melody_id=mel_id,
                                style=style, seed=seed, adapter=adapter_path,
-                               duration=duration, status="ok")
+                               duration=duration, status="ok",
+                               generated_groups=generated_groups)
                     print(f"  {stem}: ok")
                 except Exception as e:
                     log.record(file=stem, layer="layer_c_lora", melody_id=mel_id,

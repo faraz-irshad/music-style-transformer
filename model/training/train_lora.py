@@ -573,6 +573,7 @@ def _check_skyline_dominance(model, windows, control_offset, seq_len, device):
         from model.data.skyline import skyline, Note as SNote
         from model.data.features import skyline_dominance, Note as FNote
         from model.amt_utils import write_notes_to_midi, notes_to_events, events_to_pretty_midi
+        from model.generation.sampling import constrained_sampling
 
         if not windows:
             print("  No validation windows for dominance check.")
@@ -599,7 +600,7 @@ def _check_skyline_dominance(model, windows, control_offset, seq_len, device):
         controls = [t + control_offset for t in mel_events]
 
         model.eval()
-        with torch.no_grad():
+        with constrained_sampling(), torch.no_grad():
             output = generate(model, start_time=0, end_time=10,
                               inputs=[], controls=controls, top_p=0.95)
         model.train()
