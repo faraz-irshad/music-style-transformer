@@ -36,7 +36,7 @@ The accurate claim for this work is: **Style-Conditioned Piano Accompaniment Gen
 | Label | Description |
 |-------|-------------|
 | `base_amt` | Pretrained AMT, melody as controls, no style conditioning. Neutral baseline. |
-| `layer_a_scripted` | Rule-based generator. NOT a learned model. Guarantees audible contrast. |
+| `layer_a_scripted` | Rule-based generator. NOT a learned model. Its contrast must be reported from measured classifier probabilities and feature differences, not inferred from the coded constants. |
 | `layer_c_lora` | Base AMT + LoRA adapter (r=8, alpha=16) trained on MAESTRO. |
 
 ### 3.2 Layer A (Rule-Based)
@@ -45,7 +45,11 @@ Baroque rules: walking bass (stepwise quarter notes), staccato articulation (40%
 
 Romantic rules: octave bass on beat 1, rolling arpeggios on beats 2-4, legato articulation (95% of beat duration), rubato (+-5% timing jitter), rising dynamics (velocity increases linearly over the piece).
 
-Chords are chosen diatonically from the estimated key (Krumhansl-Schmuckler major profile). Layer A is deterministic given a fixed seed.
+Chords are selected from I, IV, V, and vi per bar using duration-weighted
+melody pitch-class weights in the estimated major key. Layer A is deterministic
+given a fixed seed. **UNVERIFIED measurement:** render `twinkle`, `g_major`,
+and `a_minor` with `python scripts/measure_layer_a.py`; include the reported
+classifier probabilities and simple feature differences here after execution.
 
 ### 3.3 Layer C (LoRA Fine-Tuning)
 
@@ -151,7 +155,7 @@ Note: AMT was pretrained on Lakh MIDI, which contains scraped commercial songs. 
 - **Small Baroque corpus**: MAESTRO's Baroque representation is limited, mostly Bach and Scarlatti. This may cause the Baroque adapter to underfit.
 - **Short training**: 200 optimizer steps is very short. If adapters show little effect over the base model, this is the most likely cause.
 - **No listening test**: Perceptual evaluation was cut due to time constraints.
-- **Layer A is not ML**: Layer A's strong style contrast is guaranteed by rules, not learned. It should not be compared to ML outputs as if it were ML.
+- **Layer A is not ML**: its style cues are hand-coded, not learned. Report measured probabilities/features from `scripts/measure_layer_a.py`; do not treat articulation constants as evidence of perceptual or classifier separation.
 - **Memorization**: Cannot rule out memorization of commercial melodies from Lakh MIDI pretraining.
 - **UNVERIFIED items**: See docs/VERIFIED_NOTES.md for items that could not be verified without a Colab GPU run.
 

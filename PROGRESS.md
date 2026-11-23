@@ -18,6 +18,7 @@ Style-Conditioned Piano Accompaniment Generation — BSc Thesis, ELTE
 | 6. Windowed accompaniment metrics and classifier | done | Parse performance MIDI once per path, slice manifest windows, use skyline removal for real-window classifier/distance/memorization features and for distribution/memorization comparisons, and document why real MAESTRO requires the skyline heuristic. |
 | 7. Layer C adapter lifetime | done | Load one fresh base plus one adapter for each style, reuse for that style's melodies, and collect/clear GPU cache after the style. Base generation remains a separate first pass before PEFT wrapping. |
 | 8. Full-performance window sampling | done | Seeded stratified sampling selects non-overlapping windows across the entire performance; README documents that sampling is not limited to the opening. Added tests. |
+| 9. Layer A dependencies, harmony, and measurements | done; empirical output UNVERIFIED | Corrected dependency documentation, added I/IV/V/vi bar-level pitch-class weighting and a three-melody MIDI/classifier measurement script. `tests/test_layer_a.py` and `tests/test_skyline.py` pass with `mido` and `pretty_midi`. No classifier artifact is present in `results/`, so classifier probabilities/feature differences were not generated. |
 
 ## Part 1 — train_lora.py
 

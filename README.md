@@ -15,7 +15,7 @@ Every output file is labeled with its provenance. The labels are:
 | Label | Description |
 |-------|-------------|
 | `base_amt` | Pretrained Anticipatory Music Transformer (stanford-crfm/music-medium-800k, ~360M params), melody as controls only. Neutral baseline. Pretrained on **Lakh MIDI** (not MAESTRO). |
-| `layer_a_scripted` | Rule-based generator. **NOT a learned model.** Guarantees audible Baroque vs. Romantic contrast. Never compare it to ML output as if it were ML. |
+| `layer_a_scripted` | Rule-based generator. **NOT a learned model.** Its style cues are scripted; do not claim measured contrast without classifier/feature results. |
 | `layer_b_amt_history` | **Not implemented (optional).** Would use a short key-matched MAESTRO excerpt as history. |
 | `layer_c_lora` | Base AMT + LoRA adapter (adapter_baroque or adapter_romantic), fine-tuned on cleaned MAESTRO. |
 
@@ -72,6 +72,10 @@ seeded by `data.random_seed` (rather than always taking the opening windows).
 ```bash
 python train_classifier.py --config config.yaml
 ```
+To render and measure scripted examples with the trained classifier, run
+`python scripts/measure_layer_a.py`; it reports per-style probabilities and
+Romantic-minus-Baroque feature differences for three melodies. Measurements
+are UNVERIFIED until this command is run with a current classifier.
 
 ### LoRA training (Colab GPU)
 ```bash

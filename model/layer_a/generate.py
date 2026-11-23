@@ -10,18 +10,19 @@ Never present its output as AI/ML output.
 
 Baroque rules:
   - Steady walking bass (quarter notes, stepwise or chord-tone motion)
-  - Short crisp notes (staccato: duration = 0.4 * beat)
+  - Short crisp notes (duration = 0.4 * beat)
   - Constant pulse, slow harmonic rhythm (one chord per bar)
   - Inner voices fill chord tones
 
 Romantic rules:
   - Rolling arpeggios (broken chord, bottom to top)
   - Octave bass on beat 1
-  - Sustained notes (legato: duration = 0.95 * beat)
+  - Sustained notes (duration = 0.95 * beat)
   - Slight tempo give (rubato: ±5% beat jitter)
   - Rising dynamics (velocity increases over time)
 
-Dependencies: only standard library + optional pretty_midi for WAV rendering.
+Dependencies: standard library for generation; mido for MIDI export and
+pretty_midi for MIDI loading/WAV rendering.
 """
 from __future__ import annotations
 import random
@@ -82,23 +83,10 @@ def _key_from_melody(pitches: list[int]) -> int:
     return best_key
 
 
-def _chord_for_beat(beat_idx: int, tonic: int, melody_pitch: int) -> tuple[int, ...]:
-    """
-    Choose a diatonic chord whose root is closest to the melody pitch.
-    Returns (bass_pitch, chord_tone_1, chord_tone_2) in MIDI numbers,
-    bass in octave 3 (MIDI 48–59), inner voices in octave 4–5.
-    """
-    scale = [tonic + s for s in _MAJOR_SCALE]
-    # Find scale degree closest to melody pitch class
-    mel_pc = melody_pitch % 12
-    best_deg, best_dist = 0, 13
-    for deg, s in enumerate(_MAJOR_SCALE):
-        dist = min((mel_pc - (tonic + s) % 12) % 12,
-                   ((tonic + s) % 12 - mel_pc) % 12)
-        if dist < best_dist:
-            best_dist, best_deg = dist, deg
-    intervals = _TRIAD[best_deg]
-    root_pc = (tonic + _MAJOR_SCALE[best_deg]) % 12
+def _chord_for_degree(degree: int, tonic: int) -> tuple[int, ...]:
+    """Build a diatonic triad from a major-key scale degree."""
+    intervals = _TRIAD[degree]
+    root_pc = (tonic + _MAJOR_SCALE[degree]) % 12
     # Bass in octave 3
     bass = root_pc + 48
     if bass > 59:
@@ -106,6 +94,46 @@ def _chord_for_beat(beat_idx: int, tonic: int, melody_pitch: int) -> tuple[int, 
     # Inner voices in octave 4
     inner = tuple(bass + 12 + iv for iv in intervals[1:])
     return (bass,) + inner
+
+
+def _chord_for_beat(beat_idx: int, tonic: int, melody_pitch: int) -> tuple[int, ...]:
+    """Compatibility helper using a functional cycle, not the melody as root."""
+    del melody_pitch
+    degree = (0, 3, 4, 0, 5, 3, 4, 0)[beat_idx % 8]
+    return _chord_for_degree(degree, tonic)
+
+
+def _functional_chord_degrees(
+    melody_notes: list[tuple[float, float, int]],
+    tonic: int,
+    beat: float,
+) -> list[int]:
+    """Choose I, IV, V, or vi per bar from duration-weighted melody pitch classes."""
+    if not melody_notes:
+        return [0]
+    first_beat = min(start for start, _, _ in melody_notes)
+    last_end = max(end for _, end, _ in melody_notes)
+    bar_duration = 4 * beat
+    n_bars = max(1, int((last_end - first_beat + bar_duration - 1e-9) // bar_duration))
+    candidates = (0, 3, 4, 5)
+    preference = {degree: rank for rank, degree in enumerate((0, 4, 3, 5))}
+    result = []
+    for bar in range(n_bars):
+        bar_start = first_beat + bar * bar_duration
+        bar_end = bar_start + bar_duration
+        weights = [0.0] * 12
+        for start, end, pitch in melody_notes:
+            overlap = max(0.0, min(end, bar_end) - max(start, bar_start))
+            weights[pitch % 12] += overlap
+        if not any(weights):
+            result.append(0)
+            continue
+        def score(degree: int) -> tuple[float, int]:
+            root = (tonic + _MAJOR_SCALE[degree]) % 12
+            chord_pcs = {(root + interval) % 12 for interval in _TRIAD[degree]}
+            return sum(weights[pc] for pc in chord_pcs), -preference[degree]
+        result.append(max(candidates, key=score))
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +166,7 @@ def generate_accompaniment(
 
     pitches = [p for _, _, p in melody_notes]
     tonic = _key_from_melody(pitches)
+    chord_degrees = _functional_chord_degrees(melody_notes, tonic, beat)
 
     # Determine time range
     t_start = melody_notes[0][0]
@@ -153,9 +182,13 @@ def generate_accompaniment(
     accompaniment: list[Note] = []
 
     if style == "baroque":
-        accompaniment = _baroque(melody_notes, beats, tonic, beat, rng)
+        accompaniment = _baroque(
+            melody_notes, beats, tonic, beat, rng, chord_degrees
+        )
     else:
-        accompaniment = _romantic(melody_notes, beats, tonic, beat, rng)
+        accompaniment = _romantic(
+            melody_notes, beats, tonic, beat, rng, chord_degrees
+        )
 
     return accompaniment
 
@@ -177,6 +210,7 @@ def _baroque(
     tonic: int,
     beat: float,
     rng: random.Random,
+    chord_degrees: list[int],
 ) -> list[Note]:
     """Baroque: walking bass + short chord stabs on beats 2 and 4."""
     notes: list[Note] = []
@@ -188,7 +222,7 @@ def _baroque(
         if i >= len(beats) - 1:
             break
         mel_p = _melody_pitch_at(t, melody_notes)
-        chord = _chord_for_beat(i, tonic, mel_p)
+        chord = _chord_for_degree(chord_degrees[min(i // 4, len(chord_degrees) - 1)], tonic)
         bass = chord[0]
 
         # Walking bass: stepwise motion toward chord root
@@ -220,6 +254,7 @@ def _romantic(
     tonic: int,
     beat: float,
     rng: random.Random,
+    chord_degrees: list[int],
 ) -> list[Note]:
     """Romantic: octave bass on beat 1, rolling arpeggios on beats 2–4."""
     notes: list[Note] = []
@@ -234,7 +269,7 @@ def _romantic(
         t_actual = t + jitter
 
         mel_p = _melody_pitch_at(t, melody_notes)
-        chord = _chord_for_beat(i, tonic, mel_p)
+        chord = _chord_for_degree(chord_degrees[min(i // 4, len(chord_degrees) - 1)], tonic)
         bass = chord[0]
 
         # Rising dynamics
