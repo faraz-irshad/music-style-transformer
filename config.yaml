@@ -1,0 +1,43 @@
+# config.yaml — edit paths before running data scripts on Colab
+
+data:
+  maestro_csv: "/content/maestro-v3.0.0/maestro-v3.0.0.csv"
+  maestro_midi_dir: "/content/maestro-v3.0.0/"
+  output_dir: "/content/thesis_data"
+  window_sec: 15
+  max_windows_per_perf: 5
+  max_perfs_per_work: 2
+  random_seed: 42
+
+model:
+  name: "stanford-crfm/music-medium-800k"
+  dtype: "float16"
+
+lora:
+  r: 8
+  lora_alpha: 16
+  lora_dropout: 0.05
+  target_modules: ["c_attn", "c_proj", "c_fc"]
+  fan_in_fan_out: true
+
+training:
+  seq_len: 512
+  micro_batch: 4
+  grad_accum: 4
+  lr: 2.0e-4
+  warmup_steps: 15
+  max_steps: 200
+  save_every: 50
+  random_seed: 42
+  drive_dir: "/content/drive/MyDrive/thesis_adapters"
+
+generation:
+  top_p: 0.95
+  max_new_tokens: 1024
+  random_seed: 42
+  n_test_melodies: 30
+
+evaluation:
+  results_dir: "results"
+  bootstrap_n: 1000
+  classifier_C: 1.0

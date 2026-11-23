@@ -1,0 +1,21 @@
+# Core ML — install order matters on Colab (see colab/setup_cell.py)
+# Do NOT pip install torch here; use Colab's preinstalled CUDA torch.
+transformers==4.57.6
+huggingface_hub==0.36.0
+accelerate==1.12.0
+peft==0.18.*
+
+# anticipation: install with --no-deps to avoid overwriting Colab's torch
+# pip install --no-deps git+https://github.com/jthickstun/anticipation.git
+
+# MIDI / audio
+mido==1.2.10
+pretty_midi
+scipy
+scikit-learn
+
+# Utilities
+numpy
+pandas
+matplotlib
+tqdm

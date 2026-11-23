@@ -1,0 +1,5 @@
+# Ignore generated MIDI/WAV/model files but keep CSVs, JSONs, PNGs
+midi/
+wav/
+*.pkl
+figures/
