@@ -29,6 +29,7 @@ training:
   max_steps: 200
   save_every: 50
   random_seed: 42
+  max_train_windows_per_style: 600
   drive_dir: "/content/drive/MyDrive/thesis_adapters"
 
 generation:

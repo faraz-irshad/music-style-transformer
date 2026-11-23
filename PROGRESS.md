@@ -12,6 +12,7 @@ Style-Conditioned Piano Accompaniment Generation — BSc Thesis, ELTE
 |------|--------|-------|
 | 1. Anticipation interleave/combine/clip | in progress | GitHub `anticipation/ops.py` confirms `anticipate(events, controls, delta)` returns `(tokens, unconsumed_controls)`, `combine(events, controls)` returns tokens, and `clip(tokens, start, end, clip_duration=True, seconds=True)` accepts `seconds`. Removed silent fallbacks and added a Colab interleave/generate check. Runtime check remains UNVERIFIED until run on Colab. |
 | 2. Training shuffle and transposition | done | Seed-shuffle windows and each sample epoch; choose one random transposition from -3..+3 per training window instead of concatenating shifts -6..+6. |
+| 3. Cache parsing and training window cap | done | Parse each performance once per cache build, slice windows in memory, use per-cache signatures to avoid dry-run/full-run cache collisions, add a 600-window/style cap, and report a first-20-window time estimate (or actual time for smaller runs). |
 
 ## Part 1 — train_lora.py
 

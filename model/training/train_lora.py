@@ -80,6 +80,7 @@ def _tokenise_window(
     anticipatory_prob: float,
     rng,
     shift: int = 0,
+    performance_notes: list[tuple[float, float, int]] | None = None,
 ) -> tuple[list[int], list[int], list[int]]:
     """
     Tokenise one MIDI window.
@@ -90,21 +91,21 @@ def _tokenise_window(
     from anticipation.convert import midi_to_events
     from model.data.skyline import skyline, Note as SNote
     from model.amt_utils import write_notes_to_midi
-    import pretty_midi, tempfile
+    import tempfile
 
-    pm = pretty_midi.PrettyMIDI(row["midi_path"])
     start, end = float(row["start_sec"]), float(row["end_sec"])
 
-    all_notes: list[SNote] = []
-    for inst in pm.instruments:
-        if inst.is_drum:
-            continue
-        for n in inst.notes:
-            if n.start >= start and n.end <= end:
-                all_notes.append(SNote(
-                    n.start - start, n.end - start,
-                    max(0, min(127, n.pitch + shift))
-                ))
+    if performance_notes is None:
+        performance_notes = _load_performance_notes(row["midi_path"])
+    all_notes = [
+        SNote(
+            note_start - start,
+            note_end - start,
+            max(0, min(127, pitch + shift)),
+        )
+        for note_start, note_end, pitch in performance_notes
+        if note_start >= start and note_end <= end
+    ]
 
     if not all_notes:
         pad = [0] * seq_len
@@ -147,8 +148,41 @@ def _tokenise_window(
     return ids, labels, mask
 
 
-def _cache_path(cache_dir: Path, style: str, split: str, seed: int) -> Path:
-    return cache_dir / f"{style}_{split}_seed{seed}_v2.pkl"
+def _load_performance_notes(midi_path: str) -> list[tuple[float, float, int]]:
+    import pretty_midi
+
+    pm = pretty_midi.PrettyMIDI(midi_path)
+    return [
+        (note.start, note.end, note.pitch)
+        for instrument in pm.instruments
+        if not instrument.is_drum
+        for note in instrument.notes
+    ]
+
+
+def _cache_path(
+    cache_dir: Path,
+    style: str,
+    split: str,
+    seed: int,
+    windows: list[dict],
+    control_offset: int,
+    seq_len: int,
+) -> Path:
+    import hashlib
+
+    signature = [
+        (
+            row["midi_path"],
+            float(row["start_sec"]),
+            float(row["end_sec"]),
+            row.get("window_id", ""),
+        )
+        for row in windows
+    ]
+    payload = repr((style, split, seed, control_offset, seq_len, signature))
+    digest = hashlib.sha256(payload.encode()).hexdigest()[:16]
+    return cache_dir / f"{style}_{split}_{digest}_v3.pkl"
 
 
 def build_cache(
@@ -159,36 +193,62 @@ def build_cache(
     seq_len: int,
     cache_dir: Path,
     seed: int,
+    performance_cache: dict[str, list[tuple[float, float, int]]] | None = None,
 ) -> None:
     """Pre-tokenise windows with one seeded random shift per training window."""
     import random
     cache_dir.mkdir(parents=True, exist_ok=True)
-    cp = _cache_path(cache_dir, style, split, seed)
+    cp = _cache_path(
+        cache_dir, style, split, seed, windows, control_offset, seq_len
+    )
     if cp.exists():
         return
     rng = random.Random(seed)
     shuffled_windows = list(windows)
     rng.shuffle(shuffled_windows)
+    performance_cache = performance_cache if performance_cache is not None else {}
     print(f"  Caching {style}/{split} ({len(shuffled_windows)} windows) ...")
     samples = []
-    for row in shuffled_windows:
+    cache_started = time.perf_counter()
+    for window_index, row in enumerate(shuffled_windows, start=1):
+        midi_path = str(row["midi_path"])
+        if midi_path not in performance_cache:
+            performance_cache[midi_path] = _load_performance_notes(midi_path)
         shift = rng.randint(-3, 3) if split == "train" else 0
         ids, lbls, mask = _tokenise_window(
             row, control_offset, seq_len,
             anticipatory_prob=0.5 if split == "train" else 0.0,
             rng=rng, shift=shift,
+            performance_notes=performance_cache[midi_path],
         )
         samples.append((ids, lbls, mask))
+        if window_index == 20:
+            elapsed = time.perf_counter() - cache_started
+            estimate = elapsed * len(shuffled_windows) / window_index
+            print(f"  Estimated cache time: {estimate:.1f}s "
+                  f"(measured first 20 windows)")
+    if len(shuffled_windows) < 20:
+        elapsed = time.perf_counter() - cache_started
+        print(f"  Cache time: {elapsed:.1f}s for {len(shuffled_windows)} windows "
+              "(fewer than 20; no extrapolated estimate)")
     with open(cp, "wb") as f:
         pickle.dump(samples, f)
     print(f"  Cache complete for {style}/{split}")
 
 
 def load_cached(
-    cache_dir: Path, style: str, split: str, seed: int
+    cache_dir: Path,
+    style: str,
+    split: str,
+    seed: int,
+    windows: list[dict],
+    control_offset: int,
+    seq_len: int,
 ) -> list[tuple]:
     """Load cached samples for a style/split."""
-    cp = _cache_path(cache_dir, style, split, seed)
+    cp = _cache_path(
+        cache_dir, style, split, seed, windows, control_offset, seq_len
+    )
     with open(cp, "rb") as f:
         return pickle.load(f)
 
@@ -310,17 +370,36 @@ def train(
     train_windows = load_windows(manifest_path, style, "train")
     val_windows = load_windows(manifest_path, style, "val")
     rng.shuffle(train_windows)
-    n_train = 8 if dry_run else len(train_windows)
+    window_limit = tcfg.get("max_train_windows_per_style", 600)
+    n_train = min(8, len(train_windows)) if dry_run else min(
+        window_limit, len(train_windows)
+    )
     train_windows = train_windows[:n_train]
-    print(f"Train windows: {len(train_windows)}, Val windows: {len(val_windows)}")
+    print(
+        f"Train windows: {len(train_windows)} (limit {window_limit}), "
+        f"Val windows: {len(val_windows)}"
+    )
 
     # Cache tokenised windows
     cache_dir = Path(drive_dir) / "token_cache"
     print("Building token cache (skips if already done)...")
-    build_cache(train_windows, style, "train", control_offset, seq_len, cache_dir, seed)
-    build_cache(val_windows[:8], style, "val", control_offset, seq_len, cache_dir, seed)
-    train_samples = load_cached(cache_dir, style, "train", seed)
-    val_samples = load_cached(cache_dir, style, "val", seed)
+    cache_started = time.perf_counter()
+    performance_cache: dict[str, list[tuple[float, float, int]]] = {}
+    build_cache(
+        train_windows, style, "train", control_offset, seq_len, cache_dir,
+        seed, performance_cache,
+    )
+    build_cache(
+        val_windows, style, "val", control_offset, seq_len, cache_dir,
+        seed, performance_cache,
+    )
+    print(f"Token cache build/check time: {time.perf_counter() - cache_started:.1f}s")
+    train_samples = load_cached(
+        cache_dir, style, "train", seed, train_windows, control_offset, seq_len
+    )
+    val_samples = load_cached(
+        cache_dir, style, "val", seed, val_windows, control_offset, seq_len
+    )
     print(f"Loaded {len(train_samples)} train samples, {len(val_samples)} val samples")
 
     # Optimizer
