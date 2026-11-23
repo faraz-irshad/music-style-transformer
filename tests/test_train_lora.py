@@ -94,6 +94,87 @@ def test_old_bug_would_step_every_iteration():
     print(f"old bug documented: {old_steps} steps in {max_steps} iterations (every iter) — ok")
 
 
+def test_anticipatory_sample_events_exclude_skyline(monkeypatch):
+    """Interleaved samples contain the skyline only as controls, not events."""
+    import importlib
+    import random
+    import sys
+    import types
+
+    try:
+        import torch  # noqa: F401
+    except ModuleNotFoundError:
+        torch_module = types.ModuleType("torch")
+        cuda_module = types.ModuleType("torch.cuda")
+        amp_module = types.ModuleType("torch.cuda.amp")
+        amp_module.GradScaler = lambda *args, **kwargs: None
+        amp_module.autocast = lambda *args, **kwargs: None
+        cuda_module.amp = amp_module
+        torch_module.cuda = cuda_module
+        monkeypatch.setitem(sys.modules, "torch", torch_module)
+        monkeypatch.setitem(sys.modules, "torch.cuda", cuda_module)
+        monkeypatch.setitem(sys.modules, "torch.cuda.amp", amp_module)
+
+    train_lora = importlib.import_module("model.training.train_lora")
+    anticipation = types.ModuleType("anticipation")
+    convert = types.ModuleType("anticipation.convert")
+    ops = types.SimpleNamespace()
+    written_notes = {}
+    event_streams = []
+    anticipation.ops = ops
+
+    def write_notes(notes, path):
+        written_notes[path] = list(notes)
+
+    def midi_to_events(path):
+        return [
+            token
+            for note in written_notes[path]
+            for token in (
+                round(note.start * 1000),
+                round((note.end - note.start) * 1000),
+                note.pitch,
+            )
+        ]
+
+    def anticipate(events, controls):
+        event_streams.append(list(events))
+        return list(events) + list(controls), []
+
+    convert.midi_to_events = midi_to_events
+    ops.anticipate = anticipate
+    monkeypatch.setitem(sys.modules, "anticipation", anticipation)
+    monkeypatch.setitem(sys.modules, "anticipation.convert", convert)
+    monkeypatch.setattr(
+        importlib.import_module("model.amt_utils"),
+        "write_notes_to_midi",
+        write_notes,
+    )
+
+    row = {"start_sec": 0, "end_sec": 2, "midi_path": "unused.mid"}
+    notes = [
+        (0.0, 1.0, 60), (0.0, 1.0, 72),
+        (1.0, 2.0, 64), (1.0, 2.0, 67),
+    ]
+    ids, _, _ = train_lora._tokenise_window(
+        row, 10000, 30, anticipatory_prob=1.0,
+        rng=random.Random(0), performance_notes=notes,
+    )
+    event_pairs = set(zip(event_streams[0][0::3], event_streams[0][2::3]))
+    skyline_pairs = {(0, 72), (1000, 67)}
+    assert event_pairs.isdisjoint(skyline_pairs)
+    assert ids[:3] == event_streams[0][:3]
+
+    # A melody with no accompaniment remains a plain sample.
+    plain_ids, plain_labels, _ = train_lora._tokenise_window(
+        row, 10000, 30, anticipatory_prob=1.0,
+        rng=random.Random(0), performance_notes=[(0.0, 1.0, 72)],
+    )
+    assert len(event_streams) == 1
+    assert plain_ids[:3] == [0, 1000, 72]
+    assert plain_labels[:3] == plain_ids[:3]
+
+
 # ---------------------------------------------------------------------------
 # P1.4 — Val split: load_windows raises if val split is empty
 # ---------------------------------------------------------------------------

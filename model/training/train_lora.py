@@ -122,14 +122,33 @@ def _tokenise_window(
     use_anticipatory = rng.random() < anticipatory_prob
     if use_anticipatory:
         mel = skyline(all_notes)
-        tmp2 = tempfile.NamedTemporaryFile(suffix=".mid", delete=False)
-        tmp2.close()
-        try:
-            write_notes_to_midi(mel, tmp2.name)
-            mel_events = midi_to_events(tmp2.name)
-        finally:
-            os.unlink(tmp2.name)
-        ids, labels = _build_anticipatory_sequence(events, mel_events, control_offset)
+        melody_keys = {(round(note.start, 3), note.pitch) for note in mel}
+        accompaniment = [
+            note for note in all_notes
+            if (round(note.start, 3), note.pitch) not in melody_keys
+        ]
+        if accompaniment:
+            tmp2 = tempfile.NamedTemporaryFile(suffix=".mid", delete=False)
+            tmp2.close()
+            try:
+                write_notes_to_midi(mel, tmp2.name)
+                mel_events = midi_to_events(tmp2.name)
+            finally:
+                os.unlink(tmp2.name)
+
+            tmp3 = tempfile.NamedTemporaryFile(suffix=".mid", delete=False)
+            tmp3.close()
+            try:
+                write_notes_to_midi(accompaniment, tmp3.name)
+                accompaniment_events = midi_to_events(tmp3.name)
+            finally:
+                os.unlink(tmp3.name)
+            ids, labels = _build_anticipatory_sequence(
+                accompaniment_events, mel_events, control_offset
+            )
+        else:
+            ids = list(events)
+            labels = list(events)
     else:
         ids = list(events)
         labels = list(events)
@@ -182,7 +201,7 @@ def _cache_path(
     ]
     payload = repr((style, split, seed, control_offset, seq_len, signature))
     digest = hashlib.sha256(payload.encode()).hexdigest()[:16]
-    return cache_dir / f"{style}_{split}_{digest}_v3.pkl"
+    return cache_dir / f"{style}_{split}_{digest}_v4.pkl"
 
 
 def build_cache(
