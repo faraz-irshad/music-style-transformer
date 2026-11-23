@@ -56,5 +56,7 @@ These notes will be updated once the library is cloned and its source read on Co
   trained on it carry the same license terms.
 - anticipation code and music-medium-800k weights are Apache 2.0.
 - The model has ~360M parameters (GPT-2 "medium" scale).
-- AMT was pretrained on Lakh MIDI + MAESTRO; Lakh contains scraped commercial songs,
-  so memorization of commercial melodies cannot be ruled out.
+- AMT was pretrained on **Lakh MIDI** (NOT MAESTRO). MAESTRO is used only for
+  fine-tuning in this project. This distinction matters for memorization analysis.
+- Lakh MIDI contains scraped commercial songs, so memorization of commercial
+  melodies cannot be ruled out.

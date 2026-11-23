@@ -15,7 +15,7 @@ The accurate claim for this work is: **Style-Conditioned Piano Accompaniment Gen
 
 ## 2. Related Work
 
-**Anticipatory Music Transformer (AMT)** [Thickstun et al., 2023]: A GPT-2-scale autoregressive model (~360M parameters) trained on Lakh MIDI and MAESTRO. It uses a strict 3-token event grammar (arrival time, duration, pitch) and supports hard melodic constraints via control tokens (pitch + CONTROL_OFFSET). This is the backbone of our system.
+**Anticipatory Music Transformer (AMT)** [Thickstun et al., 2023]: A GPT-2-scale autoregressive model (~360M parameters) pretrained on **Lakh MIDI** (not MAESTRO). It uses a strict 3-token event grammar (arrival time, duration, pitch) and supports hard melodic constraints via control tokens (pitch + CONTROL_OFFSET). This is the backbone of our system.
 
 **Groove2Groove** [Cífka et al., 2020]: Style transfer for accompaniment by disentangling content and style in a VAE. Operates on symbolic music; requires paired data. This is true style transfer (restyling an existing arrangement), which our work does not attempt.
 

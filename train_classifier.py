@@ -179,8 +179,10 @@ def main(config_path: str) -> None:
 
     with open(results_dir / "classifier_report.json", "w") as f:
         json.dump(report, f, indent=2)
+    # Store class names alongside the model so evaluate.py never assumes 0=baroque
+    clf_bundle = {"model": res["lr_model"], "class_names": ["baroque", "romantic"]}
     with open(results_dir / "classifier.pkl", "wb") as f:
-        pickle.dump(res["lr_model"], f)
+        pickle.dump(clf_bundle, f)
 
     print(f"\nFinal LR: acc={res['lr_accuracy']:.3f} F1={res['lr_macro_f1']:.3f}")
     print(f"Gate (>=0.75): {'PASSED' if report['gate_passed'] else 'FAILED — audit features'}")
