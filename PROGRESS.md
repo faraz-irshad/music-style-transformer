@@ -6,6 +6,24 @@ Style-Conditioned Piano Accompaniment Generation — BSc Thesis, ELTE
 
 ---
 
+## Layer A generator repair (2026-11-24)
+
+- Replaced chromatic bass stepping and Romantic onset jitter with chord-tone
+  bass choices, an explicit downbeat-anchored pulse, shared duration-weighted
+  major/minor harmonic planning, and bounded phrase-shaped dynamics. Melody
+  notes remain unchanged; accompaniment is clipped to its endpoint and MIDI
+  export validates notes and nonnegative event deltas.
+- Added `scripts/preview_layer_a.py` to export labelled source/arrangement MIDI
+  and WAV files plus key, chord-plan, timing, seed, and rendering-status
+  metadata. Existing preview outputs are not overwritten.
+- Focused validation: `python3 -m pytest -q tests/test_layer_a.py tests/test_train_lora.py::test_layer_a_imports` — 22 passed.
+- Full suite: `python3 -m pytest -q` — 46 passed.
+- Preview CLI smoke check with a temporary two-note MIDI — passed; all seven
+  expected outputs, metadata, rendering statuses, and overwrite refusal verified.
+- Example: `python3 scripts/preview_layer_a.py --melody <input.mid> --tempo 100 --beats-per-bar 4 --downbeat-sec 0 --output-dir <new-preview-dir>`
+- Musical quality remains **UNVERIFIED** pending listening; these are
+  Baroque-inspired and Romantic-inspired rule-based arrangements.
+
 ## Review round 3 (2026-11-23)
 
 | Item | Status | Notes |
