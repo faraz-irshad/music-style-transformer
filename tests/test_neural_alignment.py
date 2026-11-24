@@ -1032,12 +1032,164 @@ def test_cache_discovery_requires_one_matching_cache_for_each_role(
     assert set(selection["entries"]["baroque"]) == {
         "train_mixed", "val_unconditional", "val_conditioned",
     }
+    _, validation_samples, validation_diagnostics = (
+        training.load_selected_cache_set(
+            selection,
+            tmp_path,
+            "baroque",
+            42,
+            7,
+            0.5,
+            2,
+            1000,
+        )
+    )
+    assert set(validation_samples) == {"unconditional", "conditioned"}
+    assert set(validation_diagnostics) == {"unconditional", "conditioned"}
+    assert {
+        mode: report["objective"]
+        for mode, report in validation_diagnostics.items()
+    } == {"unconditional": "unconditional", "conditioned": "conditioned"}
     _write_explicit_cache(
         tmp_path, "baroque", "train", "mixed", anticipatory_prob=0.5,
         variant="_duplicate",
     )
     with pytest.raises(ValueError, match="expected exactly one"):
         training.discover_cache_selection(tmp_path, cfg)
+
+
+def test_cache_only_training_reports_both_validation_diagnostics_before_model_load(
+    monkeypatch, tmp_path, capsys
+):
+    import model.training.train_lora as training
+
+    torch = types.ModuleType("torch")
+    torch.cuda = types.ModuleType("torch.cuda")
+    torch.cuda.is_available = lambda: False
+    torch.manual_seed = lambda _seed: None
+    torch.nn = types.SimpleNamespace(Dropout=type("Dropout", (), {}))
+    amp = types.ModuleType("torch.cuda.amp")
+    amp.GradScaler = lambda **_kwargs: None
+    amp.autocast = lambda **_kwargs: None
+    peft = types.ModuleType("peft")
+    peft.LoraConfig = object
+    peft.get_peft_model = lambda *_args: None
+    anticipation = types.ModuleType("anticipation")
+    anticipation.__path__ = []
+    vocab = types.ModuleType("anticipation.vocab")
+    vocab.CONTROL_OFFSET = 1000
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "torch.cuda", torch.cuda)
+    monkeypatch.setitem(sys.modules, "torch.cuda.amp", amp)
+    monkeypatch.setitem(sys.modules, "peft", peft)
+    monkeypatch.setitem(sys.modules, "anticipation", anticipation)
+    monkeypatch.setitem(sys.modules, "anticipation.vocab", vocab)
+
+    sample = ([1, 2, 3], [-100, 2, 3], [1, 1, 1])
+    diagnostics = {
+        mode: {
+            "mode": mode,
+            "objective": mode,
+            "style": "baroque",
+            "cache_identity": f"baroque_val_{mode}",
+            "produced_examples": 1,
+        }
+        for mode in ("unconditional", "conditioned")
+    }
+    monkeypatch.setattr(
+        training,
+        "load_selected_cache_set",
+        lambda *_args: (
+            [sample],
+            {"unconditional": [sample], "conditioned": [sample]},
+            diagnostics,
+        ),
+    )
+
+    class ModelLoadReached(Exception):
+        pass
+
+    model_load = []
+
+    def fail_if_model_load_starts(*_args):
+        model_load.append(True)
+        raise ModelLoadReached
+
+    monkeypatch.setattr(training, "load_base_model", fail_if_model_load_starts)
+    cfg = {
+        "training": {
+            "random_seed": 42,
+            "seq_len": 3,
+            "context_groups": 1,
+            "anticipatory_prob": 0.5,
+            "invalid_window_policy": training.INVALID_WINDOW_POLICY,
+            "experiment_name": "neural_alignment_v1",
+            "max_steps": 1,
+            "micro_batch": 1,
+            "grad_accum": 1,
+            "save_every": 1,
+        },
+        "model": {"name": "mock-model"},
+    }
+    selection = {
+        "schema": training.CACHE_SELECTION_SCHEMA,
+        "cache_dir": str((tmp_path / "experiments/neural_alignment_v1/token_cache").resolve()),
+    }
+    with pytest.raises(ModelLoadReached):
+        training.train(
+            "baroque",
+            None,
+            str(tmp_path),
+            cfg,
+            cache_selection=selection,
+            cache_only=True,
+        )
+    output = capsys.readouterr().out
+    assert "Validation unconditional:" in output
+    assert "Validation conditioned:" in output
+    assert '"cache_identity": "baroque_val_unconditional"' in output
+    assert '"cache_identity": "baroque_val_conditioned"' in output
+    assert model_load == [True]
+
+    model_load.clear()
+    monkeypatch.setattr(
+        training,
+        "load_selected_cache_set",
+        lambda *_args: (
+            [sample],
+            {"unconditional": [sample], "conditioned": [sample]},
+            {"unconditional": diagnostics["unconditional"]},
+        ),
+    )
+    with pytest.raises(ValueError, match="diagnostics must contain exactly"):
+        training.train(
+            "baroque",
+            None,
+            str(tmp_path),
+            cfg,
+            cache_selection=selection,
+            cache_only=True,
+        )
+    assert model_load == []
+
+
+def test_validation_cache_mapping_rejects_missing_diagnostics_before_model(
+):
+    import model.training.train_lora as training
+
+    sample = ([1], [-100], [1])
+    samples = {"unconditional": [sample], "conditioned": [sample]}
+    diagnostics = {
+        "unconditional": {
+            "mode": "unconditional",
+            "objective": "unconditional",
+            "style": "baroque",
+        }
+    }
+    with pytest.raises(ValueError, match="diagnostics must contain exactly"):
+        training._validate_validation_cache_mappings(
+            samples, diagnostics, "baroque"
+        )
 
 
 def test_optimizer_skip_and_causal_attention_count_are_explicit():

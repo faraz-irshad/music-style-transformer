@@ -761,15 +761,37 @@ def load_explicit_cache(
     control_offset: int,
 ) -> list[tuple[list[int], list[int], list[int]]]:
     """Load one explicitly selected cache and verify its embedded identity."""
+    samples, _ = _load_explicit_cache_with_diagnostics(
+        cache_path, style, split, mode, seed, seq_len, anticipatory_prob,
+        context_groups, control_offset,
+    )
+    return samples
+
+
+def _load_explicit_cache_with_diagnostics(
+    cache_path: str | Path,
+    style: str,
+    split: str,
+    mode: str,
+    seed: int,
+    seq_len: int,
+    anticipatory_prob: float,
+    context_groups: int,
+    control_offset: int,
+) -> tuple[
+    list[tuple[list[int], list[int], list[int]]],
+    dict,
+]:
     cache_path = Path(cache_path)
     if not cache_path.is_file():
         raise FileNotFoundError(f"selected cache does not exist: {cache_path}")
     with cache_path.open("rb") as handle:
         cached = pickle.load(handle)
-    return _validate_cached_payload(
+    samples = _validate_cached_payload(
         cached, cache_path, style, split, mode, seed, seq_len,
         anticipatory_prob, context_groups, control_offset,
     )
+    return samples, cached["diagnostics"]
 
 
 def discover_cache_selection(
@@ -853,6 +875,7 @@ def load_selected_cache_set(
 ) -> tuple[
     list[tuple[list[int], list[int], list[int]]],
     dict[str, list[tuple[list[int], list[int], list[int]]]],
+    dict[str, dict],
 ]:
     if selection.get("schema") != CACHE_SELECTION_SCHEMA:
         raise ValueError("incompatible explicit cache selection schema")
@@ -874,17 +897,57 @@ def load_selected_cache_set(
         entries["train_mixed"], style, "train", "mixed", seed, seq_len,
         anticipatory_prob, context_groups, control_offset,
     )
-    validation_samples = {
-        "unconditional": load_explicit_cache(
-            entries["val_unconditional"], style, "val", "unconditional",
+    validation_samples = {}
+    validation_diagnostics = {}
+    for mode, role in (
+        ("unconditional", "val_unconditional"),
+        ("conditioned", "val_conditioned"),
+    ):
+        (
+            validation_samples[mode],
+            validation_diagnostics[mode],
+        ) = _load_explicit_cache_with_diagnostics(
+            entries[role], style, "val", mode,
             seed, seq_len, 0.0, context_groups, control_offset,
-        ),
-        "conditioned": load_explicit_cache(
-            entries["val_conditioned"], style, "val", "conditioned",
-            seed, seq_len, 0.0, context_groups, control_offset,
-        ),
-    }
-    return train_samples, validation_samples
+        )
+    return train_samples, validation_samples, validation_diagnostics
+
+
+def _validate_validation_cache_mappings(
+    samples_by_mode: dict,
+    diagnostics_by_mode: dict,
+    style: str,
+) -> None:
+    expected_modes = {"unconditional", "conditioned"}
+    if set(samples_by_mode) != expected_modes:
+        raise ValueError(
+            f"{style} validation samples must contain exactly "
+            f"{sorted(expected_modes)}; got {sorted(samples_by_mode)}"
+        )
+    if set(diagnostics_by_mode) != expected_modes:
+        raise ValueError(
+            f"{style} validation diagnostics must contain exactly "
+            f"{sorted(expected_modes)}; got {sorted(diagnostics_by_mode)}"
+        )
+    for mode in sorted(expected_modes):
+        if not samples_by_mode[mode]:
+            raise ValueError(f"{style} {mode} validation cache has no samples")
+        diagnostics = diagnostics_by_mode[mode]
+        if not isinstance(diagnostics, dict) or not diagnostics:
+            raise ValueError(
+                f"{style} {mode} validation cache has no diagnostics"
+            )
+        if (
+            diagnostics.get("mode") != mode
+            or diagnostics.get("objective") != mode
+            or diagnostics.get("style") != style
+        ):
+            raise ValueError(
+                f"{style} {mode} validation diagnostics have mismatched "
+                f"identity: mode={diagnostics.get('mode')!r}, "
+                f"objective={diagnostics.get('objective')!r}, "
+                f"style={diagnostics.get('style')!r}"
+            )
 
 
 def _sha256_file(path: Path) -> str:
@@ -1081,37 +1144,6 @@ def train(
     rng = random.Random(seed)
     torch.manual_seed(seed)
 
-    # Load model
-    base = load_base_model(cfg["model"]["name"], device)
-    for parameter in base.parameters():
-        parameter.requires_grad = False
-    if hasattr(base, "config") and hasattr(base.config, "use_cache"):
-        base.config.use_cache = False
-    for module in base.modules():  # base model was not trained with dropout
-        if isinstance(module, torch.nn.Dropout):
-            module.p = 0.0
-    base.enable_input_require_grads()
-    base.gradient_checkpointing_enable()
-    if hasattr(base, "is_gradient_checkpointing") and not base.is_gradient_checkpointing:
-        raise RuntimeError("gradient checkpointing did not enable on the base model")
-
-    lora_cfg_dict = cfg["lora"]
-    _verify_lora_targets(base, lora_cfg_dict["target_modules"])
-
-    lora_config = LoraConfig(
-        r=lora_cfg_dict["r"],
-        lora_alpha=lora_cfg_dict["lora_alpha"],
-        lora_dropout=lora_cfg_dict["lora_dropout"],
-        target_modules=lora_cfg_dict["target_modules"],
-        fan_in_fan_out=lora_cfg_dict["fan_in_fan_out"],
-        bias="none",
-    )
-    model = get_peft_model(base, lora_config)
-    model.print_trainable_parameters()
-    _assert_trainable_parameters(model)
-    if hasattr(model, "config") and hasattr(model.config, "use_cache"):
-        model.config.use_cache = False
-
     max_steps = 1 if smoke_test else (5 if dry_run else tcfg["max_steps"])
     micro_batch = tcfg["micro_batch"]
     grad_accum = tcfg["grad_accum"]
@@ -1121,8 +1153,9 @@ def train(
     train_windows: list[dict] = []
     val_windows: list[dict] = []
     if selected_cache_samples is not None:
-        train_samples, val_samples_by_mode = selected_cache_samples
-        val_diagnostics = {}
+        train_samples, val_samples_by_mode, val_diagnostics = (
+            selected_cache_samples
+        )
         print(f"Loaded explicitly selected caches from {cache_dir}")
     else:
         if manifest_path is None:
@@ -1179,6 +1212,9 @@ def train(
             context_groups=tcfg.get("context_groups", 170),
             invalid_window_policy=invalid_window_policy,
         )
+    _validate_validation_cache_mappings(
+        val_samples_by_mode, val_diagnostics, style
+    )
     if not train_samples:
         raise ValueError(f"No supervised training examples for {style}; see diagnostics")
     for validation_mode, mode_samples in val_samples_by_mode.items():
@@ -1187,6 +1223,38 @@ def train(
             f"diagnostics={json.dumps(val_diagnostics[validation_mode], sort_keys=True)}"
         )
     print(f"Loaded {len(train_samples)} supervised train examples")
+
+    # Do not load the GPU model until both validation objectives and their
+    # diagnostic provenance have been checked and reported.
+    base = load_base_model(cfg["model"]["name"], device)
+    for parameter in base.parameters():
+        parameter.requires_grad = False
+    if hasattr(base, "config") and hasattr(base.config, "use_cache"):
+        base.config.use_cache = False
+    for module in base.modules():  # base model was not trained with dropout
+        if isinstance(module, torch.nn.Dropout):
+            module.p = 0.0
+    base.enable_input_require_grads()
+    base.gradient_checkpointing_enable()
+    if hasattr(base, "is_gradient_checkpointing") and not base.is_gradient_checkpointing:
+        raise RuntimeError("gradient checkpointing did not enable on the base model")
+
+    lora_cfg_dict = cfg["lora"]
+    _verify_lora_targets(base, lora_cfg_dict["target_modules"])
+
+    lora_config = LoraConfig(
+        r=lora_cfg_dict["r"],
+        lora_alpha=lora_cfg_dict["lora_alpha"],
+        lora_dropout=lora_cfg_dict["lora_dropout"],
+        target_modules=lora_cfg_dict["target_modules"],
+        fan_in_fan_out=lora_cfg_dict["fan_in_fan_out"],
+        bias="none",
+    )
+    model = get_peft_model(base, lora_config)
+    model.print_trainable_parameters()
+    _assert_trainable_parameters(model)
+    if hasattr(model, "config") and hasattr(model.config, "use_cache"):
+        model.config.use_cache = False
 
     save_dir = None if smoke_test else prepare_new_adapter_dir(
         experiment_root, style
