@@ -24,6 +24,33 @@ Style-Conditioned Piano Accompaniment Generation — BSc Thesis, ELTE
 - Musical quality remains **UNVERIFIED** pending listening; these are
   Baroque-inspired and Romantic-inspired rule-based arrangements.
 
+## Neural alignment experiment preparation (2026-11-25)
+
+- Added explicit REST padding, anticipation control interleaving, masked
+  controls, and context-aware chunks so conditioned examples retain their
+  melody context and each accompaniment target is supervised once. Gradient
+  accumulation, validation, and NLL aggregation are weighted by supervised
+  token counts.
+- Pinned Anticipation to `af37397922665a0fb8d474d7988b0f3755a38d45`; introduced
+  versioned cache/metric identities and an isolated adapter output location
+  that refuses unsafe weights-only resume or overwrite. Legacy adapters remain
+  resolvable as fallbacks.
+- Added a local conditioned-generation compatibility loop that preserves
+  time-zero controls, clips generated accompaniment at the melody endpoint,
+  and routes experiment outputs separately. Added a CPU-only preprocessing
+  audit: `python3 scripts/diagnose_lora_data.py --style baroque --split all`
+  (use `--style romantic` for Romantic data). Only its `--help` was run here;
+  the data audit requires the pinned Anticipation dependency and dataset.
+- Tests executed: `python3 -m pytest -q tests/test_neural_alignment.py tests/test_train_lora.py`
+  — 26 passed; `python3 -m pytest -q` — 65 passed; `python3 -m compileall -q
+  model/training model/generation model/evaluation scripts tests` and
+  `git diff --check` — passed. Notebook JSON and individual code-cell syntax
+  checks passed. `python3 scripts/diagnose_lora_data.py --help` passed.
+- No model training, dataset regeneration, model download, or GPU run was
+  started. Colab/runtime behavior, dataset diagnostics, learned-model
+  generation, and musical quality remain **UNVERIFIED**; existing adapters and
+  historical evaluation outputs have not been regenerated.
+
 ## Review round 3 (2026-11-23)
 
 | Item | Status | Notes |

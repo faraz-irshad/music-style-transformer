@@ -30,6 +30,12 @@ training:
   save_every: 50
   random_seed: 42
   max_train_windows_per_style: 600
+  # New experiments never reuse the historical adapter directories.
+  experiment_name: "neural_alignment_v1"
+  anticipatory_prob: 0.5
+  context_groups: 170
+  # Null evaluates every deterministic validation example.
+  validation_max_examples: null
   drive_dir: "/content/drive/MyDrive/thesis_adapters"
 
 generation:
@@ -38,8 +44,12 @@ generation:
   max_new_tokens: 1024
   random_seed: 42
   n_test_melodies: 30
+  # New generation outputs are isolated from historical result files.
+  output_dir: "results/neural_alignment_v1"
 
 evaluation:
   results_dir: "results"
+  # Null evaluates every held-out manifest window in NLL diagnostics.
+  nll_test_max_windows: null
   bootstrap_n: 1000
   classifier_C: 1.0

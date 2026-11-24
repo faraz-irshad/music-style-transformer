@@ -95,38 +95,38 @@ def test_old_bug_would_step_every_iteration():
 
 
 def test_anticipatory_sample_events_exclude_skyline(monkeypatch):
-    """Samples include their generation prefix and align event groups."""
+    """Conditioned samples supervise accompaniment but keep melody as controls."""
     import importlib
     import random
     import sys
     import types
-
-    try:
-        import torch  # noqa: F401
-    except ModuleNotFoundError:
-        torch_module = types.ModuleType("torch")
-        cuda_module = types.ModuleType("torch.cuda")
-        amp_module = types.ModuleType("torch.cuda.amp")
-        amp_module.GradScaler = lambda *args, **kwargs: None
-        amp_module.autocast = lambda *args, **kwargs: None
-        cuda_module.amp = amp_module
-        torch_module.cuda = cuda_module
-        monkeypatch.setitem(sys.modules, "torch", torch_module)
-        monkeypatch.setitem(sys.modules, "torch.cuda", cuda_module)
-        monkeypatch.setitem(sys.modules, "torch.cuda.amp", amp_module)
 
     train_lora = importlib.import_module("model.training.train_lora")
     anticipation = types.ModuleType("anticipation")
     anticipation.__path__ = []
     convert = types.ModuleType("anticipation.convert")
     vocab = types.ModuleType("anticipation.vocab")
-    vocab.ANTICIPATE = 9001
-    vocab.AUTOREGRESS = 9002
-    ops = types.SimpleNamespace()
+    config = types.ModuleType("anticipation.config")
+    vocab.TIME_OFFSET = 0
+    vocab.DUR_OFFSET = 10000
+    vocab.NOTE_OFFSET = 11000
+    vocab.MAX_TIME = 10000
+    vocab.MAX_DUR = 1000
+    vocab.MAX_NOTE = 16512
+    vocab.REST = vocab.NOTE_OFFSET + vocab.MAX_NOTE
+    vocab.CONTROL_OFFSET = vocab.REST + 1
+    vocab.ATIME_OFFSET = vocab.CONTROL_OFFSET
+    vocab.ADUR_OFFSET = vocab.ATIME_OFFSET + vocab.MAX_TIME
+    vocab.ANOTE_OFFSET = vocab.ADUR_OFFSET + vocab.MAX_DUR
+    vocab.ANTICIPATE = 30000
+    vocab.AUTOREGRESS = 30001
+    config.TIME_RESOLUTION = 100
+    config.DELTA = 5
     written_notes = {}
-    event_streams = []
+    ops = types.SimpleNamespace()
     anticipation.ops = ops
     anticipation.vocab = vocab
+    anticipation.config = config
 
     def write_notes(notes, path):
         written_notes[path] = list(notes)
@@ -136,21 +136,24 @@ def test_anticipatory_sample_events_exclude_skyline(monkeypatch):
             token
             for note in written_notes[path]
             for token in (
-                round(note.start * 1000),
-                round((note.end - note.start) * 1000),
-                note.pitch,
+                round(note.start * 100),
+                10000 + round((note.end - note.start) * 100),
+                11000 + note.pitch,
             )
         ]
 
-    def anticipate(events, controls):
-        event_streams.append(list(events))
+    def anticipate(events, controls, delta=500):
         return list(events) + list(controls), []
 
     convert.midi_to_events = midi_to_events
     ops.anticipate = anticipate
+    for module_name, module in (
+        ("anticipation.config", config),
+        ("anticipation.vocab", vocab),
+    ):
+        monkeypatch.setitem(sys.modules, module_name, module)
     monkeypatch.setitem(sys.modules, "anticipation", anticipation)
     monkeypatch.setitem(sys.modules, "anticipation.convert", convert)
-    monkeypatch.setitem(sys.modules, "anticipation.vocab", vocab)
     monkeypatch.setattr(
         importlib.import_module("model.amt_utils"),
         "write_notes_to_midi",
@@ -162,25 +165,28 @@ def test_anticipatory_sample_events_exclude_skyline(monkeypatch):
         (0.0, 1.0, 60), (0.0, 1.0, 72),
         (1.0, 2.0, 64), (1.0, 2.0, 67),
     ]
-    ids, labels, mask = train_lora._tokenise_window(
-        row, 10000, 30, anticipatory_prob=1.0,
+    examples = train_lora._tokenise_window(
+        row, vocab.CONTROL_OFFSET, 30, anticipatory_prob=1.0,
         rng=random.Random(0), performance_notes=notes,
     )
-    event_pairs = set(zip(event_streams[0][0::3], event_streams[0][2::3]))
-    skyline_pairs = {(0, 72), (1000, 67)}
-    assert event_pairs.isdisjoint(skyline_pairs)
+    assert len(examples) == 1
+    ids, labels, mask = examples[0]
     assert ids[0] == vocab.ANTICIPATE
     assert labels[0] == -100
     assert mask[0] == 1
-    interleaved_length = sum(mask)
-    assert (interleaved_length - 1) % 3 == 0
-    assert ids[1:4] == event_streams[0][:3]
+    assert (sum(mask) - 1) % 3 == 0
+    supervised = [token for token in labels if token != -100]
+    assert 11000 + 60 in supervised
+    assert 11000 + 64 in supervised
+    assert 11000 + 72 not in supervised
+    assert 11000 + 67 not in supervised
 
     # Plain samples carry AUTOREGRESS and use the same event-group alignment.
-    plain_ids, plain_labels, plain_mask = train_lora._tokenise_window(
-        row, 10000, 30, anticipatory_prob=0.0,
+    plain_examples = train_lora._tokenise_window(
+        row, vocab.CONTROL_OFFSET, 30, anticipatory_prob=0.0,
         rng=random.Random(0), performance_notes=notes,
     )
+    plain_ids, plain_labels, plain_mask = plain_examples[0]
     assert plain_ids[0] == vocab.AUTOREGRESS
     assert plain_labels[0] == -100
     assert plain_mask[0] == 1
@@ -188,13 +194,12 @@ def test_anticipatory_sample_events_exclude_skyline(monkeypatch):
     assert (plain_length - 1) % 3 == 0
 
     # A melody with no accompaniment falls back to a plain sample.
-    plain_ids, plain_labels, _ = train_lora._tokenise_window(
-        row, 10000, 30, anticipatory_prob=1.0,
+    rest_examples = train_lora._tokenise_window(
+        row, vocab.CONTROL_OFFSET, 30, anticipatory_prob=1.0,
         rng=random.Random(0), performance_notes=[(0.0, 1.0, 72)],
     )
-    assert len(event_streams) == 1
-    assert plain_ids[0] == vocab.AUTOREGRESS
-    assert plain_labels[0] == -100
+    assert rest_examples[0][0][0] == vocab.ANTICIPATE
+    assert vocab.REST in rest_examples[0][1]
 
 
 # ---------------------------------------------------------------------------

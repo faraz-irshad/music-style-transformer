@@ -5,8 +5,8 @@ huggingface_hub==0.36.0
 accelerate==1.12.0
 peft==0.18.*
 
-# anticipation: install with --no-deps to avoid overwriting Colab's torch
-# pip install --no-deps git+https://github.com/jthickstun/anticipation.git
+# anticipation: pinned source; install with --no-deps to preserve Colab's torch
+# pip install --no-deps git+https://github.com/jthickstun/anticipation.git@af37397922665a0fb8d474d7988b0f3755a38d45
 
 # MIDI / audio
 mido==1.2.10

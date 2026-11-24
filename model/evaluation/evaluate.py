@@ -270,13 +270,29 @@ def main(config_path: str) -> None:
         cfg = yaml.safe_load(f)
 
     results_dir = Path(cfg["evaluation"]["results_dir"])
-    midi_dir = results_dir / "midi"
-    fig_dir = results_dir / "figures"
+    generation_dir = Path(cfg["generation"].get(
+        "output_dir", results_dir / "neural_alignment_v1"
+    ))
+    evaluation_dir = generation_dir / "evaluation"
+    output_paths = (
+        evaluation_dir / "evaluation_results.csv",
+        evaluation_dir / "evaluation_summary.json",
+        evaluation_dir / "figures" / "clf_probs.png",
+    )
+    existing = [path for path in output_paths if path.exists()]
+    if existing:
+        raise FileExistsError(
+            "refusing to overwrite evaluation output(s): "
+            + ", ".join(str(path) for path in existing)
+        )
+    midi_dir = generation_dir / "midi"
+    fig_dir = evaluation_dir / "figures"
+    evaluation_dir.mkdir(parents=True, exist_ok=True)
     fig_dir.mkdir(parents=True, exist_ok=True)
     bootstrap_n = cfg["evaluation"]["bootstrap_n"]
 
     # Load generation manifest
-    gen_log_path = results_dir / "generation_log.csv"
+    gen_log_path = generation_dir / "generation_log.csv"
     if not gen_log_path.exists():
         print(f"generation_log.csv not found at {gen_log_path}. Run generate.py first.")
         return
@@ -393,8 +409,8 @@ def main(config_path: str) -> None:
         rows.append(row)
 
     df = pd.DataFrame(rows)
-    df.to_csv(results_dir / "evaluation_results.csv", index=False)
-    print(f"Saved {len(df)} rows to {results_dir}/evaluation_results.csv")
+    df.to_csv(evaluation_dir / "evaluation_results.csv", index=False)
+    print(f"Saved {len(df)} rows to {evaluation_dir}/evaluation_results.csv")
     available_matches = df["melody_found_fraction"].dropna()
     if len(available_matches):
         flagged = int((available_matches < 0.8).sum())
@@ -570,9 +586,9 @@ def main(config_path: str) -> None:
         "distribution_distances": dist_results,
         "memorization": mem_results,
     }
-    with open(results_dir / "evaluation_summary.json", "w") as f:
+    with open(evaluation_dir / "evaluation_summary.json", "w") as f:
         json.dump(summary, f, indent=2)
-    print(f"\nSummary saved to {results_dir}/evaluation_summary.json")
+    print(f"\nSummary saved to {evaluation_dir}/evaluation_summary.json")
 
     _make_plots(df, fig_dir)
 

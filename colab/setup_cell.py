@@ -18,9 +18,10 @@ run("pip install -q pyfluidsynth")
 run("pip install -q transformers==4.57.6 huggingface_hub==0.36.0 "
     "accelerate==1.12.0 'peft==0.18.*'")
 
-# 3. Install anticipation without touching torch
+# 3. Install the inspected Anticipation revision without touching torch.
 run("pip install -q --no-deps "
-    "git+https://github.com/jthickstun/anticipation.git")
+    "git+https://github.com/jthickstun/anticipation.git@"
+    "af37397922665a0fb8d474d7988b0f3755a38d45")
 
 # 4. MIDI / audio / ML utilities
 run("pip install -q mido==1.2.10 pretty_midi scipy scikit-learn pyyaml")
