@@ -1192,15 +1192,239 @@ def test_validation_cache_mapping_rejects_missing_diagnostics_before_model(
         )
 
 
+class _RetryTestOptimizer:
+    def __init__(self):
+        self.updates = 0
+        self.clears = 0
+
+    def zero_grad(self):
+        self.clears += 1
+
+
+class _RetryTestScaler:
+    def __init__(self, scales):
+        self.scales = list(scales)
+        self.current_scale = self.scales[0]
+        self.skip_update = False
+        self.update_skips = []
+
+    def get_scale(self):
+        return self.current_scale
+
+    def step(self, optimizer):
+        if not self.skip_update:
+            optimizer.updates += 1
+
+    def update(self):
+        self.update_skips.append(self.skip_update)
+        if self.skip_update:
+            self.scales.pop(0)
+            self.current_scale = self.scales[0]
+        self.skip_update = False
+
+
+class _RetryTestScheduler:
+    def __init__(self):
+        self.steps = 0
+
+    def step(self):
+        self.steps += 1
+
+
+def _retry_test_outcome(scaler, *, loss=1.0, nonfinite=(), skip=False):
+    scaler.skip_update = bool(nonfinite) or skip
+    return {
+        "loss": loss,
+        "nonfinite_gradients": list(nonfinite),
+        "amp_enabled": True,
+    }
+
+
+def test_optimizer_overflow_backs_off_and_retries_same_accumulated_batch(
+    capsys,
+):
+    import model.training.train_lora as training
+
+    optimizer = _RetryTestOptimizer()
+    scheduler = _RetryTestScheduler()
+    scaler = _RetryTestScaler([8.0, 4.0, 4.0])
+    attempts = []
+
+    def attempt(retry, scale):
+        attempts.append(("selected-batch", retry, scale))
+        if retry == 0:
+            return _retry_test_outcome(
+                scaler, nonfinite=("lora_A.weight",)
+            )
+        return _retry_test_outcome(scaler)
+
+    loss, retries = training._run_optimizer_update_with_retries(
+        attempt, scaler, optimizer, scheduler, step=1
+    )
+    assert loss == 1.0
+    assert retries == 1
+    assert [entry[0] for entry in attempts] == [
+        "selected-batch", "selected-batch",
+    ]
+    assert [entry[1] for entry in attempts] == [0, 1]
+    assert optimizer.updates == 1
+    assert scheduler.steps == 1
+    assert scaler.update_skips == [True, False]
+    assert "lora_A.weight" in capsys.readouterr().out
+
+
+def test_amp_retry_exhaustion_never_advances_optimizer_or_scheduler():
+    import model.training.train_lora as training
+
+    optimizer = _RetryTestOptimizer()
+    scheduler = _RetryTestScheduler()
+    scaler = _RetryTestScaler([16.0, 8.0, 4.0, 2.0, 1.0])
+    attempts = []
+
+    def attempt(retry, _scale):
+        attempts.append(retry)
+        return _retry_test_outcome(
+            scaler, nonfinite=("lora_B.weight",)
+        )
+
+    with pytest.raises(RuntimeError, match="AMP retries exhausted"):
+        training._run_optimizer_update_with_retries(
+            attempt, scaler, optimizer, scheduler, step=3, max_retries=2
+        )
+    assert attempts == [0, 1, 2]
+    assert optimizer.updates == 0
+    assert scheduler.steps == 0
+
+
+def test_grad_scaler_skip_does_not_count_step_or_advance_scheduler():
+    import model.training.train_lora as training
+
+    optimizer = _RetryTestOptimizer()
+    scheduler = _RetryTestScheduler()
+    scaler = _RetryTestScaler([8.0, 4.0, 4.0])
+    attempts = []
+
+    def attempt(retry, _scale):
+        attempts.append(retry)
+        return _retry_test_outcome(scaler, skip=(retry == 0))
+
+    _, retries = training._run_optimizer_update_with_retries(
+        attempt, scaler, optimizer, scheduler, step=1
+    )
+    assert retries == 1
+    assert attempts == [0, 1]
+    assert optimizer.updates == 1
+    assert scheduler.steps == 1
+
+
+def test_nonfinite_forward_loss_fails_before_backward():
+    import model.training.train_lora as training
+
+    for loss in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(RuntimeError, match="non-finite forward loss"):
+            training._require_finite_loss(loss, scale=128.0, step=1)
+
+
+class _GradientTestTensor:
+    def __init__(self, values):
+        self.values = list(values)
+        self.dtype = "float32"
+        self.mul_calls = []
+
+    def all(self):
+        return _GradientTestScalar(all(math.isfinite(value) for value in self.values))
+
+    def item(self):
+        return self.values[0]
+
+    def detach(self):
+        return self
+
+    def to(self, dtype):
+        assert dtype == "float64"
+        return self
+
+    def mul_(self, coefficient):
+        self.mul_calls.append(coefficient)
+        self.values = [value * coefficient for value in self.values]
+
+
+class _GradientTestScalar:
+    def __init__(self, value):
+        self.value = value
+
+    def item(self):
+        return self.value
+
+
+class _GradientTestLinalg:
+    def __init__(self, norm_override=None):
+        self.norm_override = norm_override
+
+    def vector_norm(self, tensor, ord):
+        assert ord == 2
+        value = (
+            self.norm_override if self.norm_override is not None
+            else math.hypot(*tensor.values)
+        )
+        return _GradientTestScalar(value)
+
+
+class _GradientTestTorch:
+    float64 = "float64"
+
+    def __init__(self, norm_override=None):
+        self.linalg = _GradientTestLinalg(norm_override)
+
+    def isfinite(self, tensor):
+        return tensor
+
+
+class _GradientTestParameter:
+    requires_grad = True
+
+    def __init__(self, values):
+        self.grad = _GradientTestTensor(values)
+
+
+def test_gradient_element_overflow_reports_parameter_without_clipping():
+    import model.training.train_lora as training
+
+    parameter = _GradientTestParameter([float("inf"), 1.0])
+    norm, bad_names = training._inspect_and_clip_gradients(
+        [("lora_A.weight", parameter)],
+        _GradientTestTorch(),
+        scale=64.0,
+        step=1,
+    )
+    assert norm is None
+    assert bad_names == ["lora_A.weight"]
+    assert parameter.grad.mul_calls == []
+
+
+def test_finite_gradient_elements_with_nonfinite_norm_reduction_fail_distinctly():
+    import model.training.train_lora as training
+
+    parameter = _GradientTestParameter([1.0, 2.0])
+    with pytest.raises(
+        RuntimeError,
+        match="non-finite gradient norm reduction despite finite gradient elements",
+    ):
+        training._inspect_and_clip_gradients(
+            [("lora_B.weight", parameter)],
+            _GradientTestTorch(norm_override=float("inf")),
+            scale=32.0,
+            step=2,
+        )
+    assert parameter.grad.mul_calls == []
+
+
 def test_optimizer_skip_and_causal_attention_count_are_explicit():
     import model.training.train_lora as training
 
     assert training._causal_supervised_token_count(
         [-100, 1, 2, 3], [1, 1, 0, 1]
     ) == 2
-    with pytest.raises(RuntimeError, match="skipped an optimizer update"):
-        training._assert_scaler_did_not_skip(8.0, 4.0)
-    training._assert_scaler_did_not_skip(8.0, 8.0)
 
 
 def test_nll_preparation_uses_configured_context_and_stable_chunk_ids(

@@ -1023,12 +1023,145 @@ def _assert_trainable_parameters(model) -> None:
     print(f"  Frozen base; {len(trainable)} trainable fp32 LoRA tensors")
 
 
-def _assert_scaler_did_not_skip(scale_before: float, scale_after: float) -> None:
-    if scale_after < scale_before:
+MAX_AMP_UPDATE_RETRIES = 3
+
+
+def _require_finite_loss(loss: float, scale: float, step: int) -> None:
+    if not math.isfinite(loss):
         raise RuntimeError(
-            "GradScaler skipped an optimizer update after detecting non-finite "
-            f"gradients (scale {scale_before} -> {scale_after}); training stopped"
+            f"optimizer step {step} has non-finite forward loss {loss}; "
+            f"current AMP scale={scale}. No backward or optimizer update was run."
         )
+
+
+def _inspect_and_clip_gradients(
+    named_parameters,
+    torch,
+    scale: float,
+    step: int,
+    max_norm: float = 1.0,
+) -> tuple[float | None, list[str]]:
+    parameters_with_grad = [
+        (name, parameter)
+        for name, parameter in named_parameters
+        if parameter.requires_grad and parameter.grad is not None
+    ]
+    nonfinite_names = [
+        name for name, parameter in parameters_with_grad
+        if not bool(torch.isfinite(parameter.grad).all().item())
+    ]
+    if nonfinite_names:
+        return None, nonfinite_names
+    if not parameters_with_grad:
+        raise RuntimeError(
+            f"optimizer step {step} has no gradients; current AMP scale={scale}"
+        )
+
+    squared_norm = 0.0
+    for name, parameter in parameters_with_grad:
+        parameter_norm = float(
+            torch.linalg.vector_norm(
+                parameter.grad.detach().to(dtype=torch.float64), ord=2
+            ).item()
+        )
+        if not math.isfinite(parameter_norm):
+            names = [entry_name for entry_name, _ in parameters_with_grad]
+            raise RuntimeError(
+                f"optimizer step {step} has a non-finite gradient norm reduction "
+                "despite finite gradient elements; "
+                f"AMP scale={scale}, contributing parameters={names}"
+            )
+        squared_norm += parameter_norm * parameter_norm
+        if not math.isfinite(squared_norm):
+            names = [entry_name for entry_name, _ in parameters_with_grad]
+            raise RuntimeError(
+                f"optimizer step {step} has a non-finite global gradient norm "
+                "reduction despite finite gradient elements; "
+                f"AMP scale={scale}, contributing parameters={names}"
+            )
+    gradient_norm = math.sqrt(squared_norm)
+    if not math.isfinite(gradient_norm) or gradient_norm <= 0:
+        names = [name for name, _ in parameters_with_grad]
+        raise RuntimeError(
+            f"optimizer step {step} has invalid gradient norm {gradient_norm}; "
+            f"AMP scale={scale}, contributing parameters={names}"
+        )
+    clip_coefficient = min(1.0, max_norm / gradient_norm)
+    if clip_coefficient < 1.0:
+        for _, parameter in parameters_with_grad:
+            parameter.grad.mul_(clip_coefficient)
+    return gradient_norm, []
+
+
+def _run_optimizer_update_with_retries(
+    attempt,
+    scaler,
+    optimizer,
+    scheduler,
+    step: int,
+    max_retries: int = MAX_AMP_UPDATE_RETRIES,
+) -> tuple[float, int]:
+    """Run one accumulated update, retrying only GradScaler-skipped attempts."""
+    for retry in range(max_retries + 1):
+        scale_before = float(scaler.get_scale())
+        outcome = attempt(retry, scale_before)
+        gradient_names = outcome["nonfinite_gradients"]
+        if gradient_names and not outcome["amp_enabled"]:
+            optimizer.zero_grad()
+            raise RuntimeError(
+                f"optimizer step {step} has non-finite gradient elements with AMP "
+                f"disabled; scale={scale_before}, parameters={gradient_names}"
+            )
+        if gradient_names:
+            scaler.step(optimizer)
+            scaler.update()
+            scale_after = float(scaler.get_scale())
+            optimizer.zero_grad()
+            print(
+                f"AMP backoff at optimizer step {step}: attempt {retry + 1}/"
+                f"{max_retries + 1}; non-finite gradient elements observed in "
+                f"{gradient_names}; scale {scale_before} -> {scale_after}. "
+                "GradScaler handled the unsafe update; the scale change alone "
+                "does not establish the underlying cause."
+            )
+            if scale_after >= scale_before:
+                raise RuntimeError(
+                    f"GradScaler did not lower its scale after non-finite "
+                    f"gradients at optimizer step {step}; parameters="
+                    f"{gradient_names}, scale={scale_before}->{scale_after}"
+                )
+            if retry == max_retries:
+                raise RuntimeError(
+                    f"AMP retries exhausted at optimizer step {step}; "
+                    f"non-finite gradient parameters={gradient_names}, "
+                    f"scale={scale_before}->{scale_after}"
+                )
+            continue
+
+        scaler.step(optimizer)
+        scaler.update()
+        scale_after = float(scaler.get_scale())
+        if scale_after < scale_before:
+            optimizer.zero_grad()
+            print(
+                f"AMP backoff at optimizer step {step}: attempt {retry + 1}/"
+                f"{max_retries + 1}; GradScaler skipped the update; "
+                f"our gradient scan found no non-finite elements; scale "
+                f"{scale_before} -> {scale_after}. The scale change alone "
+                "does not establish the underlying cause."
+            )
+            if retry == max_retries:
+                raise RuntimeError(
+                    f"AMP retries exhausted at optimizer step {step} after "
+                    f"GradScaler skipped the update; scale="
+                    f"{scale_before}->{scale_after}"
+                )
+            continue
+
+        scheduler.step()
+        optimizer.zero_grad()
+        return float(outcome["loss"]), retry
+    raise AssertionError("bounded optimizer retry loop exited unexpectedly")
 
 
 def _causal_supervised_token_count(
@@ -1382,37 +1515,40 @@ def train(
             token_counts.append(valid_tokens)
 
         loss_weights = token_weighted_loss_weights(token_counts)
-        optimizer.zero_grad()
-        step_loss = 0.0
-        for (batch_ids, batch_labels, batch_mask), weight in zip(
-            micro_batches, loss_weights
-        ):
-            ids_t = torch.tensor(batch_ids, dtype=torch.long, device=device)
-            lbl_t = torch.tensor(batch_labels, dtype=torch.long, device=device)
-            mask_t = torch.tensor(batch_mask, dtype=torch.long, device=device)
-            with autocast(enabled=device == "cuda"):
-                output = model(
-                    input_ids=ids_t, attention_mask=mask_t, labels=lbl_t
-                )
-                weighted_loss = output.loss * weight
-            scaler.scale(weighted_loss).backward()
-            step_loss += float(output.loss.item()) * weight
+        def attempt_update(_retry: int, scale: float) -> dict:
+            optimizer.zero_grad()
+            step_loss = 0.0
+            for (batch_ids, batch_labels, batch_mask), weight in zip(
+                micro_batches, loss_weights
+            ):
+                ids_t = torch.tensor(batch_ids, dtype=torch.long, device=device)
+                lbl_t = torch.tensor(batch_labels, dtype=torch.long, device=device)
+                mask_t = torch.tensor(batch_mask, dtype=torch.long, device=device)
+                with autocast(enabled=device == "cuda"):
+                    output = model(
+                        input_ids=ids_t, attention_mask=mask_t, labels=lbl_t
+                    )
+                    loss_value = float(output.loss.item())
+                    if not math.isfinite(loss_value):
+                        optimizer.zero_grad()
+                    _require_finite_loss(loss_value, scale, step + 1)
+                    weighted_loss = output.loss * weight
+                scaler.scale(weighted_loss).backward()
+                step_loss += loss_value * weight
 
-        scaler.unscale_(optimizer)
-        gradient_norm = torch.nn.utils.clip_grad_norm_(
-            (p for p in model.parameters() if p.requires_grad), 1.0
-        )
-        if not torch.isfinite(gradient_norm) or gradient_norm.item() <= 0:
-            raise RuntimeError(
-                f"optimizer step {step + 1} has invalid gradient norm "
-                f"{gradient_norm.item()}"
+            scaler.unscale_(optimizer)
+            _, nonfinite_gradients = _inspect_and_clip_gradients(
+                model.named_parameters(), torch, scale, step + 1, max_norm=1.0
             )
-        scale_before = scaler.get_scale()
-        scaler.step(optimizer)
-        scaler.update()
-        _assert_scaler_did_not_skip(scale_before, scaler.get_scale())
-        scheduler.step()
-        optimizer.zero_grad()
+            return {
+                "loss": step_loss,
+                "nonfinite_gradients": nonfinite_gradients,
+                "amp_enabled": device == "cuda",
+            }
+
+        step_loss, retries = _run_optimizer_update_with_retries(
+            attempt_update, scaler, optimizer, scheduler, step + 1
+        )
         step += 1
         if device == "cuda":
             torch.cuda.synchronize()
@@ -1422,6 +1558,7 @@ def train(
             "step": step,
             "train_loss": step_loss,
             "s_per_step": elapsed,
+            "amp_retries": retries,
         }
 
         if dry_run:
