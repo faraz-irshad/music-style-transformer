@@ -8,17 +8,24 @@ Run on Colab after training. No model is downloaded by importing this module.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 
-import torch
 import yaml
+
+from model.training.sequence import (
+    CACHE_SCHEMA,
+    INVALID_WINDOW_POLICY,
+    SEQUENCE_POLICY,
+)
 
 
 def _nll_decomposed(
     model, ids_t: torch.Tensor, lbl_t: torch.Tensor, mask_t: torch.Tensor
 ) -> dict[str, float | int]:
     """Return causal teacher-forced NLL and event-field decompositions."""
+    import torch
     from torch.cuda.amp import autocast
 
     with torch.no_grad(), autocast():
@@ -33,9 +40,13 @@ def _nll_decomposed(
         2, shift_labels.clamp(min=0).unsqueeze(-1)
     ).squeeze(-1)
     per_token_nll = per_token_nll * valid.float()
+    valid_count = int(valid.sum().item())
     results: dict[str, float | int] = {
-        "total": float(out.loss.item()),
-        "valid_tokens": int(valid.sum().item()),
+        "total": (
+            float(per_token_nll.sum().item() / valid_count)
+            if valid_count else float("nan")
+        ),
+        "valid_tokens": valid_count,
     }
 
     # The mode token occupies position zero; shifted labels then follow the
@@ -53,22 +64,33 @@ def _nll_decomposed(
     return results
 
 
-def score_windows(
-    model,
+class IncompleteComparisonError(RuntimeError):
+    pass
+
+
+def prepare_examples(
     windows: list[dict],
     control_offset: int,
     seq_len: int,
-    device: str,
     mode: str,
-) -> list[dict[str, float | int]]:
-    """Score all context-aligned examples, preserving the selected objective."""
+    context_groups: int = 170,
+) -> list[dict]:
+    """Prepare a stable, shared example set once for every model comparison."""
     import random
-    from model.training.train_lora import _tokenise_window
+    from model.training.train_lora import (
+        _load_performance_notes,
+        _tokenise_window,
+    )
 
     rng = random.Random(42)
-    scores = []
+    performance_cache = {}
+    prepared = []
     for row in windows:
+        path = str(row.get("midi_path", "<missing>"))
         try:
+            path = str(row["midi_path"])
+            if path not in performance_cache:
+                performance_cache[path] = _load_performance_notes(path)
             examples = _tokenise_window(
                 row,
                 control_offset,
@@ -76,22 +98,115 @@ def score_windows(
                 anticipatory_prob=0.0,
                 rng=rng,
                 shift=0,
+                performance_notes=performance_cache[path],
                 mode=mode,
+                context_groups=context_groups,
             )
-            for ids, labels, attention in examples:
-                ids_t = torch.tensor([ids], dtype=torch.long, device=device)
-                labels_t = torch.tensor([labels], dtype=torch.long, device=device)
-                mask_t = torch.tensor([attention], dtype=torch.long, device=device)
-                score = _nll_decomposed(model, ids_t, labels_t, mask_t)
-                if score["valid_tokens"]:
-                    scores.append(score)
-        except Exception:
-            import traceback
-            print(
-                f"  skip {row.get('window_id', '?')} ({mode}):\n"
-                + traceback.format_exc()
+        except Exception as exc:
+            raise IncompleteComparisonError(
+                f"could not prepare {row.get('window_id', path)} "
+                f"for objective {mode}: {type(exc).__name__}: {exc}"
+            ) from exc
+        if not examples:
+            raise IncompleteComparisonError(
+                f"window {row.get('window_id', path)} produced no examples "
+                f"for objective {mode}"
             )
+        window_id = str(row.get("window_id") or (
+            f"{path}:{row.get('start_sec')}:{row.get('end_sec')}"
+        ))
+        window_identity = json.dumps(
+            [
+                window_id,
+                path,
+                float(row["start_sec"]),
+                float(row["end_sec"]),
+            ],
+            separators=(",", ":"),
+        )
+        stable_window_id = (
+            f"{window_id}::{hashlib.sha256(window_identity.encode()).hexdigest()[:12]}"
+        )
+        for chunk_id, (ids, labels, attention) in enumerate(examples):
+            valid_tokens = sum(
+                label >= 0 and mask
+                for label, mask in zip(labels[1:], attention[1:])
+            )
+            if not valid_tokens:
+                raise IncompleteComparisonError(
+                    f"{window_id} chunk {chunk_id} has no supervised tokens"
+                )
+            prepared.append({
+                "example_id": f"{stable_window_id}::chunk-{chunk_id:05d}",
+                "window_id": window_id,
+                "chunk_id": chunk_id,
+                "ids": ids,
+                "labels": labels,
+                "attention": attention,
+                "valid_tokens": valid_tokens,
+            })
+    if not prepared:
+        raise IncompleteComparisonError(
+            f"no examples prepared for objective {mode}"
+        )
+    return prepared
+
+
+def score_prepared_examples(
+    model,
+    examples: list[dict],
+    device: str,
+    model_label: str,
+) -> list[dict[str, float | int | str]]:
+    """Score every prepared example or reject the model comparison."""
+    import torch
+    scores = []
+    for example in examples:
+        example_id = example["example_id"]
+        try:
+            ids_t = torch.tensor([example["ids"]], dtype=torch.long, device=device)
+            labels_t = torch.tensor(
+                [example["labels"]], dtype=torch.long, device=device
+            )
+            mask_t = torch.tensor(
+                [example["attention"]], dtype=torch.long, device=device
+            )
+            score = _nll_decomposed(model, ids_t, labels_t, mask_t)
+            if score["valid_tokens"] != example["valid_tokens"]:
+                raise ValueError(
+                    f"token count changed from {example['valid_tokens']} "
+                    f"to {score['valid_tokens']}"
+                )
+        except Exception as exc:
+            raise IncompleteComparisonError(
+                f"{model_label} failed on {example_id}; comparison incomplete: "
+                f"{type(exc).__name__}: {exc}"
+            ) from exc
+        scores.append({
+            "example_id": example_id,
+            "window_id": example["window_id"],
+            "chunk_id": example["chunk_id"],
+            **score,
+        })
+    expected_ids = [example["example_id"] for example in examples]
+    actual_ids = [score["example_id"] for score in scores]
+    if actual_ids != expected_ids:
+        raise IncompleteComparisonError(
+            f"{model_label} score IDs do not match prepared comparison examples"
+        )
     return scores
+
+
+def require_matching_examples(
+    reference: list[dict], comparison: list[dict], label: str
+) -> None:
+    reference_ids = [row["example_id"] for row in reference]
+    comparison_ids = [row["example_id"] for row in comparison]
+    if reference_ids != comparison_ids:
+        raise IncompleteComparisonError(
+            f"{label} has {len(comparison_ids)} scored examples; expected "
+            f"{len(reference_ids)} with identical ordered IDs"
+        )
 
 
 def mean_scores(
@@ -133,8 +248,9 @@ def _adapter_path(cfg: dict, style: str) -> Path:
 
 
 def main(config_path: str) -> None:
+    import torch
     import anticipation.vocab as acfg
-    from model.training.train_lora import load_windows
+    from model.training.train_lora import _sequence_settings, load_windows
     from model.generation.generate import load_clean_base
 
     with open(config_path) as f:
@@ -143,9 +259,17 @@ def main(config_path: str) -> None:
     manifest_path = str(Path(cfg["data"]["output_dir"]) / "manifest.csv")
     model_name = cfg["model"]["name"]
     seq_len = cfg["training"]["seq_len"]
+    context_groups = cfg["training"].get("context_groups", 170)
+    invalid_window_policy = cfg["training"].get(
+        "invalid_window_policy", INVALID_WINDOW_POLICY
+    )
+    if invalid_window_policy != INVALID_WINDOW_POLICY:
+        raise ValueError(
+            f"unsupported invalid_window_policy {invalid_window_policy!r}"
+        )
     results_dir = Path(cfg["evaluation"]["results_dir"])
     results_dir.mkdir(parents=True, exist_ok=True)
-    output_path = results_dir / "nll_matrix_alignment_v1.json"
+    output_path = results_dir / "nll_matrix_alignment_v2.json"
     if output_path.exists():
         raise FileExistsError(f"refusing to overwrite {output_path}")
 
@@ -163,44 +287,96 @@ def main(config_path: str) -> None:
         style: len(windows) for style, windows in windows_by_style.items()
     }))
 
-    matrix = {}
-    base = load_clean_base(model_name, device)
-    base.eval()
+    prepared_by_objective = {}
     for style, windows in windows_by_style.items():
         for mode in ("unconditional", "conditioned"):
-            matrix[f"base_{style}_{mode}"] = mean_scores(
-                score_windows(
-                    base, windows, control_offset, seq_len, device, mode
-                )
+            prepared_by_objective[(style, mode)] = prepare_examples(
+                windows, control_offset, seq_len, mode, context_groups
             )
+
+    results = {}
+    per_example_scores = {}
+    base_scores = {}
+    base = load_clean_base(model_name, device)
+    base.eval()
+    for style in windows_by_style:
+        for mode in ("unconditional", "conditioned"):
+            key = f"base_{style}_{mode}"
+            scores = score_prepared_examples(
+                base,
+                prepared_by_objective[(style, mode)],
+                device,
+                model_label=key,
+            )
+            base_scores[(style, mode)] = scores
+            results[key] = mean_scores(scores)
+            per_example_scores[key] = scores
     del base
 
+    model_paths = {"base": {"model_identifier": model_name, "adapter_path": None}}
+    missing_adapters = []
     for adapter_style in ("baroque", "romantic"):
         adapter_path = _adapter_path(cfg, adapter_style)
+        model_paths[f"adapter_{adapter_style}"] = {
+            "model_identifier": model_name,
+            "adapter_path": str(adapter_path),
+        }
         if not adapter_path.exists():
             print(f"  adapter_{adapter_style} not found at {adapter_path}; skipping")
+            missing_adapters.append(str(adapter_path))
             continue
         from peft import PeftModel
 
         fresh = load_clean_base(model_name, device)
         model = PeftModel.from_pretrained(fresh, str(adapter_path))
         model.eval()
-        for style, windows in windows_by_style.items():
+        for style in windows_by_style:
             for mode in ("unconditional", "conditioned"):
-                matrix[f"adapter_{adapter_style}_{style}_{mode}"] = mean_scores(
-                    score_windows(
-                        model, windows, control_offset, seq_len, device, mode
-                    )
+                key = f"adapter_{adapter_style}_{style}_{mode}"
+                scores = score_prepared_examples(
+                    model,
+                    prepared_by_objective[(style, mode)],
+                    device,
+                    model_label=key,
                 )
+                require_matching_examples(
+                    base_scores[(style, mode)], scores, key
+                )
+                results[key] = mean_scores(scores)
+                per_example_scores[key] = scores
         del model, fresh
 
-    for key, scores in matrix.items():
-        print(f"{key}: {scores}")
+    for key, aggregate in results.items():
+        print(f"{key}: {aggregate}")
+    comparison_status = (
+        "incomplete_missing_adapters" if missing_adapters else "complete"
+    )
     output_path.write_text(json.dumps({
-        "objective_version": "aligned-v1-unconditional-and-conditioned",
+        "objective_version": "aligned-v2-paired-unconditional-and-conditioned",
         "aggregation": "supervised-token-weighted",
         "validation_window_limit": limit,
-        "results": matrix,
+        "model_identifier": model_name,
+        "models": model_paths,
+        "comparison_status": comparison_status,
+        "missing_adapters": missing_adapters,
+        "preprocessing": {
+            "cache_schema": CACHE_SCHEMA,
+            "sequence_policy": SEQUENCE_POLICY,
+            "invalid_window_policy": invalid_window_policy,
+            "sequence_length": seq_len,
+            "context_groups": context_groups,
+            "timing": _sequence_settings(control_offset).__dict__,
+            "window_selection": "notes-fully-contained-in-manifest-window-v1",
+            "pitch_shift": 0,
+            "anticipatory_probability": 0.0,
+            "seed": 42,
+        },
+        "example_counts": {
+            f"{style}_{mode}": len(examples)
+            for (style, mode), examples in prepared_by_objective.items()
+        },
+        "results": results,
+        "per_example_scores": per_example_scores,
     }, indent=2) + "\n", encoding="utf-8")
     print(f"Saved to {output_path}")
 

@@ -51,6 +51,33 @@ Style-Conditioned Piano Accompaniment Generation — BSc Thesis, ELTE
   generation, and musical quality remain **UNVERIFIED**; existing adapters and
   historical evaluation outputs have not been regenerated.
 
+## Neural pipeline reliability follow-up
+
+- Made preprocessing fail closed with per-window diagnostics, source-content
+  cache fingerprints, and explicit cache policy identity. Added a positive
+  generation event budget and final one-to-one melody-preservation validation.
+- Made generation logs distinguish complete, partial, and failed outputs;
+  WAV rendering now reports its selected backend and failures rather than
+  silently substituting a renderer. Optional velocity balancing operates on
+  copied audio and does not alter source MIDI.
+- NLL comparisons now use one stable, shared set of context-aware chunks,
+  reject incomplete model comparisons, aggregate by supervised tokens, and
+  record comparison settings. Demo indexing and evaluation include usable
+  partial generations.
+- Added real pinned-Anticipation CPU integration tests. They were **not
+  executed against the library here** because the pinned dependency is absent:
+  `python3 -m pytest -q tests/integration/test_anticipation_integration.py -rs`
+  — 8 skipped with the explicit missing-dependency reason.
+- Latest focused validation:
+  `python3 -m pytest -q tests/test_neural_alignment.py tests/test_train_lora.py`
+  — 50 passed. `python3 -m compileall -q model/training model/generation
+  model/evaluation model/amt_utils.py scripts/preview_layer_a.py
+  controller/build_demo_index.py tests` — passed.
+- No training, GPU run, model/dataset download, or dataset regeneration was
+  started. Real Anticipation integration, model-backed generation, data
+  diagnostics, and musical quality remain **UNVERIFIED** pending an equipped
+  runtime and listening.
+
 ## Review round 3 (2026-11-23)
 
 | Item | Status | Notes |

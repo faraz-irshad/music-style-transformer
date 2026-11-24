@@ -297,7 +297,7 @@ def main(config_path: str) -> None:
         print(f"generation_log.csv not found at {gen_log_path}. Run generate.py first.")
         return
     gen_log = pd.read_csv(gen_log_path)
-    gen_log = gen_log[gen_log["status"] == "ok"].reset_index(drop=True)
+    gen_log = gen_log[gen_log["status"].isin(("ok", "partial"))].reset_index(drop=True)
 
     # Load classifier (with class names stored inside)
     clf_path = results_dir / "classifier.pkl"

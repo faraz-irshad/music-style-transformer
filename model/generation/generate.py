@@ -19,11 +19,10 @@ UNVERIFIED (require Colab run):
   - events_to_midi return type (normalised in amt_utils.events_to_pretty_midi)
 """
 from __future__ import annotations
-import argparse, csv, sys
+import argparse, csv, json, sys
 from collections import Counter
 from pathlib import Path
 
-import torch
 import yaml
 
 STYLES = ("baroque", "romantic")
@@ -68,6 +67,7 @@ def save_melody_midi(melody_notes: list[tuple[float, float, int]], path: str) ->
 def load_clean_base(model_name: str, device: str):
     """Load a fresh base model with no LoRA modules."""
     import traceback
+    import torch
 
     try:
         from transformers import AutoModelForCausalLM
@@ -117,30 +117,50 @@ def _combine_and_slice(
     controls: list[int],
     duration: float,
 ) -> list[int]:
-    """Clip generated events; preserve complete melody controls in the result."""
+    """Clip accompaniment and verify merged melody at 25/50 ms onset/duration tolerances."""
     from anticipation import ops
     from anticipation import vocab
+    from anticipation.config import TIME_RESOLUTION
 
     clipped_events = ops.clip(generated_events, 0, duration, seconds=True)
     combined = ops.combine(clipped_events, controls)
-    generated_pairs = Counter(
-        (time, pitch)
-        for time, _note_duration, pitch in zip(
-            clipped_events[0::3], clipped_events[1::3], clipped_events[2::3]
-        )
-    )
-    melody_pairs = [
-        (time - vocab.CONTROL_OFFSET, pitch - vocab.CONTROL_OFFSET)
-        for time, _duration, pitch in zip(
-            controls[0::3], controls[1::3], controls[2::3]
-        )
+    time_tolerance = max(1, round(0.025 * TIME_RESOLUTION))
+    duration_tolerance = max(1, round(0.05 * TIME_RESOLUTION))
+    candidates = [
+        tuple(combined[index:index + 3])
+        for index in range(0, len(combined), 3)
     ]
+    unmatched = set(range(len(candidates)))
     matched = 0
-    for pair in melody_pairs:
-        if generated_pairs[pair]:
+    for index in range(0, len(controls), 3):
+        expected = tuple(
+            token - vocab.CONTROL_OFFSET for token in controls[index:index + 3]
+        )
+        matches = [
+            candidate_index for candidate_index in unmatched
+            if candidates[candidate_index][2] == expected[2]
+            and abs(candidates[candidate_index][0] - expected[0]) <= time_tolerance
+            and abs(candidates[candidate_index][1] - expected[1])
+            <= duration_tolerance
+        ]
+        if matches:
+            best = min(
+                matches,
+                key=lambda candidate_index: (
+                    abs(candidates[candidate_index][0] - expected[0])
+                    + abs(candidates[candidate_index][1] - expected[1]),
+                    candidate_index,
+                ),
+            )
+            unmatched.remove(best)
             matched += 1
-            generated_pairs[pair] -= 1
-    print(f"  clipped melody notes present: {matched}/{len(melody_pairs)}")
+    print(f"  melody notes present after merge: {matched}/{len(controls) // 3}")
+    if matched != len(controls) // 3:
+        raise RuntimeError(
+            f"merged stream contains {matched}/{len(controls) // 3} melody notes "
+            f"within {time_tolerance} onset ticks and {duration_tolerance} "
+            "duration ticks"
+        )
     return combined
 
 
@@ -194,17 +214,19 @@ def generate_base_amt(
     duration: float,
     top_p: float,
     seed: int,
+    max_events: int = 100_000,
 ) -> list[int]:
     """Base AMT: melody as controls, no style adapter. Generated ONCE per melody."""
     from model.generation.sampling import constrained_sampling
     from model.generation.anticipation_compat import generate_conditioned
+    import torch
     _assert_no_lora(model, "base_amt")
     controls = _melody_to_controls(melody_notes, control_offset)
     torch.manual_seed(seed)
     with constrained_sampling(), torch.no_grad():
         output = generate_conditioned(
             model, start_time=0, end_time=duration,
-            inputs=[], controls=controls, top_p=top_p
+            inputs=[], controls=controls, top_p=top_p, max_events=max_events
         )
     return _combine_and_slice(output, controls, duration)
 
@@ -234,16 +256,18 @@ def generate_layer_c(
     duration: float,
     top_p: float,
     seed: int,
+    max_events: int = 100_000,
 ) -> list[int]:
     """Generate Layer C output with a style adapter loaded by the caller."""
     from model.generation.sampling import constrained_sampling
     from model.generation.anticipation_compat import generate_conditioned
+    import torch
     controls = _melody_to_controls(melody_notes, control_offset)
     torch.manual_seed(seed)
     with constrained_sampling(), torch.no_grad():
         output = generate_conditioned(
             model, start_time=0, end_time=duration,
-            inputs=[], controls=controls, top_p=top_p
+            inputs=[], controls=controls, top_p=top_p, max_events=max_events
         )
     result = _combine_and_slice(output, controls, duration)
     return result
@@ -263,9 +287,16 @@ def save_midi(pm, path: str) -> None:
     save_midi_file(pm, path)
 
 
-def do_render_wav(pm, path: str) -> bool:
+def do_render_wav(pm, path: str, rendering: dict | None = None):
     from model.amt_utils import render_wav
-    return render_wav(pm, path)
+    rendering = rendering or {}
+    return render_wav(
+        pm,
+        path,
+        sr=int(rendering.get("sample_rate", 44100)),
+        soundfont_path=rendering.get("soundfont_path"),
+        backend=rendering.get("backend", "fluidsynth"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -274,7 +305,9 @@ def do_render_wav(pm, path: str) -> bool:
 
 class GenerationLog:
     FIELDS = ["file", "layer", "melody_id", "style", "seed",
-              "adapter", "duration", "generated_groups", "status", "error"]
+              "adapter", "duration", "generated_groups", "status",
+              "audio_status", "failure_stage", "render_backend",
+              "soundfont", "balance", "error"]
 
     def __init__(self, path: str) -> None:
         self.path = path
@@ -294,6 +327,10 @@ class GenerationLog:
         return sum(1 for r in self.rows if r["status"] == "failed")
 
     @property
+    def n_audio_failed(self) -> int:
+        return sum(1 for r in self.rows if r["audio_status"] == "failed")
+
+    @property
     def n_total(self) -> int:
         return len(self.rows)
 
@@ -303,6 +340,7 @@ class GenerationLog:
 # ---------------------------------------------------------------------------
 
 def main(config_path: str) -> None:
+    import torch
     import anticipation.vocab as acfg
     from model.generation.adapter_paths import resolve_adapter_path
 
@@ -311,6 +349,9 @@ def main(config_path: str) -> None:
 
     top_p = cfg["generation"]["top_p"]
     seed = cfg["generation"]["random_seed"]
+    max_events = cfg["generation"].get("max_events", 100_000)
+    rendering = cfg.get("rendering", {})
+    balance_enabled = bool(rendering.get("balance_melody_accompaniment", False))
     drive_dir = cfg["training"]["drive_dir"]
     model_name = cfg["model"]["name"]
 
@@ -360,29 +401,88 @@ def main(config_path: str) -> None:
         save_melody_midi(melody_notes, str(midi_dir / f"melody_{mel_id}.mid"))
 
         stem = f"base_amt_{mel_id}_none"
+        stage = "sampling"
+        audio_status = "not_attempted"
+        render_result = None
+        balance_info = {"enabled": False}
+        error = ""
         try:
             events = generate_base_amt(
-                base_model, melody_notes, control_offset, duration, top_p, seed
+                base_model, melody_notes, control_offset, duration, top_p, seed,
+                max_events=max_events,
             )
+            stage = "token conversion"
             pm = events_to_pm(events)
+            stage = "MIDI write"
             save_midi(pm, str(midi_dir / f"{stem}.mid"))
-            if do_render_wav(pm, str(wav_dir / f"{stem}.wav")):
+            stage = "rendering"
+            render_result = do_render_wav(
+                pm, str(wav_dir / f"{stem}.wav"), rendering
+            )
+            audio_status = "ok" if render_result.success else "failed"
+            if render_result.success:
                 n_wav += 1
+            else:
+                error = render_result.error
+            if balance_enabled:
+                stage = "balancing"
+                from model.amt_utils import balance_melody_accompaniment
+                balanced_pm, balance_info = balance_melody_accompaniment(
+                    pm,
+                    melody_notes,
+                    melody_velocity=int(rendering.get("melody_velocity", 80)),
+                    accompaniment_gain=float(
+                        rendering.get("accompaniment_gain", 0.55)
+                    ),
+                    onset_tolerance_sec=float(
+                        rendering.get("onset_tolerance_sec", 0.03)
+                    ),
+                    duration_tolerance_sec=float(
+                        rendering.get("duration_tolerance_sec", 0.05)
+                    ),
+                )
+                stage = "rendering"
+                balanced_result = do_render_wav(
+                    balanced_pm,
+                    str(wav_dir / f"{stem}_balanced.wav"),
+                    rendering,
+                )
+                balance_info["render"] = balanced_result.as_dict()
+                if balanced_result.success:
+                    n_wav += 1
+                else:
+                    audio_status = "failed"
+                    error = "; ".join(filter(None, (error, balanced_result.error)))
+            stage = "metric counting"
             generated_groups = _generated_group_count(
                 events, melody_notes, control_offset
             )
             _warn_if_sparse(stem, generated_groups)
             log.record(file=stem, layer="base_amt", melody_id=mel_id,
                        style="none", seed=seed, adapter="none",
-                       duration=duration, status="ok",
+                       duration=duration,
+                       status="ok" if audio_status == "ok" else "partial",
+                       audio_status=audio_status,
+                       failure_stage="rendering" if audio_status == "failed" else "",
+                       render_backend=render_result.backend,
+                       soundfont=render_result.soundfont,
+                       balance=json.dumps(balance_info, sort_keys=True),
+                       error=error,
                        generated_groups=generated_groups)
-            print(f"  {stem}: ok")
+            print(
+                f"  {stem}: MIDI ready, audio {audio_status}"
+            )
         except Exception:
             import traceback
-            error = "base_amt generation:\n" + traceback.format_exc()
+            error = f"{stage}:\n" + traceback.format_exc()
             log.record(file=stem, layer="base_amt", melody_id=mel_id,
                        style="none", seed=seed, adapter="none",
-                       duration=duration, status="failed", error=error)
+                       duration=duration, status="failed",
+                       audio_status=audio_status, failure_stage=stage,
+                       render_backend=getattr(render_result, "backend", ""),
+                       soundfont=getattr(render_result, "soundfont", ""),
+                       balance=json.dumps(balance_info, sort_keys=True),
+                       error=error)
             print(f"  {stem}: FAILED\n{error}")
 
     del base_model  # discard — never reuse after wrapping
@@ -397,24 +497,79 @@ def main(config_path: str) -> None:
         duration = melody_endpoint(melody_notes)
         for style in STYLES:
             stem = f"layer_a_scripted_{mel_id}_{style}"
+            stage = "sampling"
+            audio_status = "not_attempted"
+            render_result = None
+            balance_info = {"enabled": False}
+            error = ""
             try:
                 pm = generate_layer_a(melody_notes, style, seed)
+                stage = "MIDI write"
                 save_midi(pm, str(midi_dir / f"{stem}.mid"))
-                if do_render_wav(pm, str(wav_dir / f"{stem}.wav")):
+                stage = "rendering"
+                render_result = do_render_wav(
+                    pm, str(wav_dir / f"{stem}.wav"), rendering
+                )
+                audio_status = "ok" if render_result.success else "failed"
+                if render_result.success:
                     n_wav += 1
+                else:
+                    error = render_result.error
+                if balance_enabled:
+                    stage = "balancing"
+                    from model.amt_utils import balance_melody_accompaniment
+                    balanced_pm, balance_info = balance_melody_accompaniment(
+                        pm,
+                        melody_notes,
+                        melody_velocity=int(rendering.get("melody_velocity", 80)),
+                        accompaniment_gain=float(
+                            rendering.get("accompaniment_gain", 0.55)
+                        ),
+                        onset_tolerance_sec=float(
+                            rendering.get("onset_tolerance_sec", 0.03)
+                        ),
+                        duration_tolerance_sec=float(
+                            rendering.get("duration_tolerance_sec", 0.05)
+                        ),
+                    )
+                    stage = "rendering"
+                    balanced_result = do_render_wav(
+                        balanced_pm,
+                        str(wav_dir / f"{stem}_balanced.wav"),
+                        rendering,
+                    )
+                    balance_info["render"] = balanced_result.as_dict()
+                    if balanced_result.success:
+                        n_wav += 1
+                    else:
+                        audio_status = "failed"
+                        error = "; ".join(filter(None, (error, balanced_result.error)))
+                stage = "metric counting"
                 generated_groups = _layer_a_group_count(pm, melody_notes)
                 _warn_if_sparse(stem, generated_groups)
                 log.record(file=stem, layer="layer_a_scripted", melody_id=mel_id,
                            style=style, seed=seed, adapter="none",
-                           duration=duration, status="ok",
+                           duration=duration,
+                           status="ok" if audio_status == "ok" else "partial",
+                           audio_status=audio_status,
+                           failure_stage="rendering" if audio_status == "failed" else "",
+                           render_backend=render_result.backend,
+                           soundfont=render_result.soundfont,
+                           balance=json.dumps(balance_info, sort_keys=True),
+                           error=error,
                            generated_groups=generated_groups)
-                print(f"  {stem}: ok")
+                print(f"  {stem}: MIDI ready, audio {audio_status}")
             except Exception:
                 import traceback
-                error = "Layer A generation:\n" + traceback.format_exc()
+                error = f"{stage}:\n" + traceback.format_exc()
                 log.record(file=stem, layer="layer_a_scripted", melody_id=mel_id,
                            style=style, seed=seed, adapter="none",
-                           duration=duration, status="failed", error=error)
+                           duration=duration, status="failed",
+                           audio_status=audio_status, failure_stage=stage,
+                           render_backend=getattr(render_result, "backend", ""),
+                           soundfont=getattr(render_result, "soundfont", ""),
+                           balance=json.dumps(balance_info, sort_keys=True),
+                           error=error)
                 print(f"  {stem}: FAILED\n{error}")
 
     # ------------------------------------------------------------------
@@ -434,10 +589,14 @@ def main(config_path: str) -> None:
         if not Path(adapter_path).exists():
             print(f"  adapter_{style}: NOT FOUND at {adapter_path} — skipping")
             for mel_path in melody_files:
+                melody_duration = melody_endpoint(
+                    load_melody_notes(str(mel_path))
+                )
                 log.record(file=f"layer_c_lora_{mel_path.stem}_{style}",
                            layer="layer_c_lora", melody_id=mel_path.stem,
                            style=style, seed=seed, adapter=adapter_path,
-                           duration=duration, status="skipped",
+                           duration=melody_duration, status="skipped",
+                           failure_stage="adapter loading",
                            error="adapter not found")
             gc.collect()
             if device == "cuda":
@@ -464,6 +623,7 @@ def main(config_path: str) -> None:
                     adapter=adapter_path,
                     duration=0.0,
                     status="failed",
+                    failure_stage="adapter loading",
                     error=error,
                 )
             print(f"  adapter_{style}: FAILED to load\n{error}")
@@ -473,30 +633,88 @@ def main(config_path: str) -> None:
                 melody_notes = load_melody_notes(str(mel_path))
                 duration = melody_endpoint(melody_notes)
                 stem = f"layer_c_lora_{mel_id}_{style}"
+                stage = "sampling"
+                audio_status = "not_attempted"
+                render_result = None
+                balance_info = {"enabled": False}
+                error = ""
                 try:
                     events = generate_layer_c(
                         layer_c_model, melody_notes, control_offset,
-                        duration, top_p, seed
+                        duration, top_p, seed, max_events=max_events
                     )
+                    stage = "token conversion"
                     pm = events_to_pm(events)
+                    stage = "MIDI write"
                     save_midi(pm, str(midi_dir / f"{stem}.mid"))
-                    if do_render_wav(pm, str(wav_dir / f"{stem}.wav")):
+                    stage = "rendering"
+                    render_result = do_render_wav(
+                        pm, str(wav_dir / f"{stem}.wav"), rendering
+                    )
+                    audio_status = "ok" if render_result.success else "failed"
+                    if render_result.success:
                         n_wav += 1
+                    else:
+                        error = render_result.error
+                    if balance_enabled:
+                        stage = "balancing"
+                        from model.amt_utils import balance_melody_accompaniment
+                        balanced_pm, balance_info = balance_melody_accompaniment(
+                            pm,
+                            melody_notes,
+                            melody_velocity=int(rendering.get("melody_velocity", 80)),
+                            accompaniment_gain=float(
+                                rendering.get("accompaniment_gain", 0.55)
+                            ),
+                            onset_tolerance_sec=float(
+                                rendering.get("onset_tolerance_sec", 0.03)
+                            ),
+                            duration_tolerance_sec=float(
+                                rendering.get("duration_tolerance_sec", 0.05)
+                            ),
+                        )
+                        stage = "rendering"
+                        balanced_result = do_render_wav(
+                            balanced_pm,
+                            str(wav_dir / f"{stem}_balanced.wav"),
+                            rendering,
+                        )
+                        balance_info["render"] = balanced_result.as_dict()
+                        if balanced_result.success:
+                            n_wav += 1
+                        else:
+                            audio_status = "failed"
+                            error = "; ".join(
+                                filter(None, (error, balanced_result.error))
+                            )
+                    stage = "metric counting"
                     generated_groups = _generated_group_count(
                         events, melody_notes, control_offset
                     )
                     _warn_if_sparse(stem, generated_groups)
                     log.record(file=stem, layer="layer_c_lora", melody_id=mel_id,
                                style=style, seed=seed, adapter=adapter_path,
-                               duration=duration, status="ok",
+                               duration=duration,
+                               status="ok" if audio_status == "ok" else "partial",
+                               audio_status=audio_status,
+                               failure_stage="rendering" if audio_status == "failed" else "",
+                               render_backend=render_result.backend,
+                               soundfont=render_result.soundfont,
+                               balance=json.dumps(balance_info, sort_keys=True),
+                               error=error,
                                generated_groups=generated_groups)
-                    print(f"  {stem}: ok")
+                    print(f"  {stem}: MIDI ready, audio {audio_status}")
                 except Exception:
                     import traceback
-                    error = "Layer C generation/export:\n" + traceback.format_exc()
+                    error = f"{stage}:\n" + traceback.format_exc()
                     log.record(file=stem, layer="layer_c_lora", melody_id=mel_id,
                                style=style, seed=seed, adapter=adapter_path,
-                               duration=duration, status="failed", error=error)
+                               duration=duration, status="failed",
+                               audio_status=audio_status, failure_stage=stage,
+                               render_backend=getattr(render_result, "backend", ""),
+                               soundfont=getattr(render_result, "soundfont", ""),
+                               balance=json.dumps(balance_info, sort_keys=True),
+                               error=error)
                     print(f"  {stem}: FAILED\n{error}")
         finally:
             del layer_c_model, fresh_base
@@ -509,8 +727,11 @@ def main(config_path: str) -> None:
     # ------------------------------------------------------------------
     log.save()
     print(f"\nGeneration complete.")
-    print(f"  Total: {log.n_total}  Failed: {log.n_failed}  WAVs: {n_wav}")
-    print(f"  Log: {results_dir}/generation_log.csv")
+    print(
+        f"  Total: {log.n_total}  Failed MIDI/metrics: {log.n_failed}  "
+        f"Failed audio renders: {log.n_audio_failed}  WAVs: {n_wav}"
+    )
+    print(f"  Log: {log.path}")
 
     fail_rate = log.n_failed / max(log.n_total, 1)
     if fail_rate > 0.20:

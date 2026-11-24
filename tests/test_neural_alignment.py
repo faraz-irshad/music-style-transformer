@@ -137,6 +137,26 @@ def test_rest_padding_consumes_every_control_or_reports_leftovers(amt_settings):
         raise UnconsumedControlsError(len(remaining) // 3)
 
 
+def test_training_control_order_matches_generation_sampler_history(amt_settings):
+    events = [
+        0, 10020, 11060,
+        600, 10020, 11064,
+        700, 10020, 11065,
+    ]
+    control = [
+        amt_settings.anticipate_time_offset + 700,
+        amt_settings.anticipate_duration_offset + 100,
+        amt_settings.control_offset + 11070,
+    ]
+    upstream, _ = interleave_anticipated_controls(events, control, amt_settings)
+    training, remaining = interleave_anticipated_controls(
+        events, control, amt_settings
+    )
+    assert not remaining
+    assert training == upstream
+    assert training.index(control[0]) < training.index(700)
+
+
 def test_chunking_masks_context_and_controls_and_supervises_every_target_once(amt_settings):
     groups = []
     for index in range(27):
@@ -199,6 +219,131 @@ def test_later_chunk_retains_controls_inside_anticipation_context(amt_settings):
         for token, label in zip(second_ids, second_labels)
         if token >= amt_settings.control_offset
     )
+
+
+@pytest.mark.parametrize("control_stride", [1, 4, 13])
+def test_dense_sparse_chunks_preserve_conditioning_order_and_targets_once(
+    amt_settings, control_stride
+):
+    events = []
+    controls = []
+    target_keys = set()
+    for index in range(45):
+        onset = index * 100
+        if index % control_stride == 0:
+            controls.extend((
+                amt_settings.anticipate_time_offset + onset,
+                amt_settings.anticipate_duration_offset + 80,
+                amt_settings.control_offset + 12000 + index,
+            ))
+        target_note = 11000 + 60 + index
+        events.extend((onset, 10020, target_note))
+        target_keys.add((onset, target_note))
+
+    stream, remaining = interleave_anticipated_controls(
+        events, controls, amt_settings
+    )
+    assert not remaining
+    source_groups = [
+        tuple(stream[index:index + 3])
+        for index in range(0, len(stream), 3)
+    ]
+    stream = [token for group in source_groups for token in group]
+    chunks = chunk_sequence(
+        stream, 40000, 70, amt_settings, context_groups=6
+    )
+    seen_targets = []
+    source_time_by_note = {
+        group[2]: group[0] - (
+            amt_settings.anticipate_time_offset
+            if group[2] >= amt_settings.control_offset
+            else amt_settings.time_offset
+        )
+        for group in source_groups
+    }
+    source_index_by_note = {
+        group[2]: index for index, group in enumerate(source_groups)
+    }
+    source_controls = [
+        (index, source_time_by_note[group[2]], group[2])
+        for index, group in enumerate(source_groups)
+        if group[2] >= amt_settings.control_offset
+    ]
+
+    for ids, labels, attention in chunks:
+        active_length = sum(attention)
+        active_groups = [
+            tuple(ids[position:position + 3])
+            for position in range(1, active_length, 3)
+        ]
+        active_labels = [
+            labels[position:position + 3]
+            for position in range(1, active_length, 3)
+        ]
+        assert active_length <= 70
+        assert (active_length - 1) % 3 == 0
+        supervised_positions = [
+            index for index, group_labels in enumerate(active_labels)
+            if any(label != -100 for label in group_labels)
+        ]
+        assert supervised_positions
+        first_target = supervised_positions[0]
+        assert all(
+            all(label == -100 for label in group_labels)
+            for group_labels in active_labels[:first_target]
+        )
+        for group, group_labels in zip(active_groups, active_labels):
+            is_control = group[2] >= amt_settings.control_offset
+            if is_control or group_labels == [-100, -100, -100]:
+                assert group_labels == [-100, -100, -100]
+            else:
+                assert group_labels == list(group)
+                seen_targets.append((
+                    source_time_by_note[group[2]], group[2]
+                ))
+
+        decoded = [
+            group[0] - (
+                amt_settings.anticipate_time_offset
+                if group[2] >= amt_settings.control_offset
+                else amt_settings.time_offset
+            )
+            for group in active_groups
+        ]
+        source_min = min(source_time_by_note[group[2]] for group in active_groups)
+        for group, translated_time in zip(active_groups, decoded):
+            assert translated_time == source_time_by_note[group[2]] - source_min
+
+        for target_position in supervised_positions:
+            target_group = active_groups[target_position]
+            target_time = source_time_by_note[target_group[2]]
+            target_source_index = source_index_by_note[target_group[2]]
+            previous_targets = [
+                source_index
+                for source_index, group in enumerate(source_groups[:target_source_index])
+                if group[2] < amt_settings.control_offset
+            ]
+            generation_current_time = (
+                source_time_by_note[source_groups[previous_targets[-1]][2]]
+                if previous_targets else 0
+            )
+            visible_control_notes = {
+                group[2] for group in active_groups[:target_position]
+                if group[2] >= amt_settings.control_offset
+            }
+            required_controls = {
+                note
+                for source_index, control_time, note in source_controls
+                if control_time >= target_time - amt_settings.anticipation_delta
+                and control_time <= (
+                    generation_current_time + amt_settings.anticipation_delta
+                )
+                and source_index < target_source_index
+            }
+            assert required_controls <= visible_control_notes
+
+    assert len(seen_targets) == len(target_keys)
+    assert set(seen_targets) == target_keys
 
 
 def test_chunk_overflow_is_explicit(amt_settings):
@@ -344,6 +489,37 @@ def test_generation_passes_time_zero_controls_to_actual_sampler(monkeypatch, amt
     assert seen[0][0] == [40000]
 
 
+def test_generation_budget_terminates_sampler_that_never_advances(monkeypatch, amt_settings):
+    _seen, settings = _install_fake_anticipation(monkeypatch, amt_settings)
+    sample = sys.modules["anticipation.sample"]
+    calls = []
+
+    def sample_same_time(*args, **kwargs):
+        calls.append(True)
+        return [settings.time_offset, settings.duration_offset + 10, 11060]
+
+    sample.add_token = sample_same_time
+    module = importlib.import_module("model.generation.anticipation_compat")
+    with pytest.raises(
+        RuntimeError,
+        match=r"after 2 events at time 0 ticks.*endpoint 100 ticks",
+    ):
+        module.generate_conditioned(
+            model=object(), start_time=0, end_time=1, max_events=2
+        )
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("budget", [0, -1, 1.5, True])
+def test_generation_budget_requires_positive_integer(budget, monkeypatch, amt_settings):
+    _install_fake_anticipation(monkeypatch, amt_settings)
+    module = importlib.import_module("model.generation.anticipation_compat")
+    with pytest.raises(ValueError, match="positive integer"):
+        module.generate_conditioned(
+            model=object(), start_time=0, end_time=1, max_events=budget
+        )
+
+
 def test_rest_is_not_removed_by_piano_sampling_mask(monkeypatch):
     from model.generation.sampling import constrained_sampling
 
@@ -380,7 +556,9 @@ def test_explicit_shorter_generation_interval_preserves_full_melody(monkeypatch)
     anticipation.__path__ = []
     ops = types.ModuleType("anticipation.ops")
     vocab = types.ModuleType("anticipation.vocab")
+    config = types.ModuleType("anticipation.config")
     vocab.CONTROL_OFFSET = 10000
+    config.TIME_RESOLUTION = 100
     ops.clip = lambda tokens, start, end, seconds=True: [
         token for group in (
             tokens[i:i + 3] for i in range(0, len(tokens), 3)
@@ -405,9 +583,11 @@ def test_explicit_shorter_generation_interval_preserves_full_melody(monkeypatch)
     ops.combine = combine
     anticipation.ops = ops
     anticipation.vocab = vocab
+    anticipation.config = config
     monkeypatch.setitem(sys.modules, "anticipation", anticipation)
     monkeypatch.setitem(sys.modules, "anticipation.ops", ops)
     monkeypatch.setitem(sys.modules, "anticipation.vocab", vocab)
+    monkeypatch.setitem(sys.modules, "anticipation.config", config)
     full_melody = [
         0, 100, 60,
         900, 200, 64,
@@ -420,6 +600,13 @@ def test_explicit_shorter_generation_interval_preserves_full_melody(monkeypatch)
     )
     assert 900 in result
     assert 700 not in result
+    ops.combine = lambda events, _controls: list(events)
+    with pytest.raises(RuntimeError, match="merged stream contains"):
+        generation._combine_and_slice(
+            generated_events=[],
+            controls=controls,
+            duration=5.0,
+        )
 
 
 def test_saved_melody_round_trip_preserves_notes_within_midi_tick(tmp_path, monkeypatch):
@@ -527,6 +714,408 @@ def test_cache_signature_changes_with_objective_or_settings(monkeypatch, amt_set
     assert len({
         unconditional, conditioned, different_length, different_context,
     }) == 4
+
+
+def test_cache_identity_tracks_source_contents(monkeypatch, tmp_path, amt_settings):
+    import model.training.train_lora as training
+
+    monkeypatch.setattr(training, "_sequence_settings", lambda _offset: amt_settings)
+    source = tmp_path / "same.mid"
+    source.write_bytes(b"first MIDI content")
+    windows = [{
+        "midi_path": str(source), "start_sec": 0.0,
+        "end_sec": 15.0, "window_id": "w0",
+    }]
+    first = training._cache_path(
+        tmp_path, "baroque", "train", 42, windows,
+        amt_settings.control_offset, 1024,
+    )
+    source.write_bytes(b"edited MIDI content")
+    second = training._cache_path(
+        tmp_path, "baroque", "train", 42, windows,
+        amt_settings.control_offset, 1024,
+    )
+    assert first != second
+
+
+def test_build_cache_reports_and_rejects_broken_window(
+    monkeypatch, tmp_path, amt_settings
+):
+    import model.training.train_lora as training
+
+    monkeypatch.setattr(training, "_sequence_settings", lambda _offset: amt_settings)
+    source = tmp_path / "source.mid"
+    source.write_bytes(b"test MIDI")
+    windows = [
+        {
+            "midi_path": str(source), "start_sec": 0.0,
+            "end_sec": 2.0, "window_id": "ok-window",
+        },
+        {
+            "midi_path": str(source), "start_sec": 2.0,
+            "end_sec": 4.0, "window_id": "broken-window",
+        },
+    ]
+
+    def tokenize(row, *_args, **_kwargs):
+        if row["window_id"] == "broken-window":
+            raise ValueError("synthetic malformed MIDI")
+        return (
+            [([1, 2, 3, 4], [-100, 2, 3, 4], [1, 1, 1, 1])],
+            {
+                "mode": "unconditional",
+                "produced_examples": 1,
+                "empty": False,
+                "all_masked_examples": 0,
+            },
+        )
+
+    monkeypatch.setattr(training, "_load_performance_notes", lambda _path: [])
+    monkeypatch.setattr(training, "_tokenise_window_with_stats", tokenize)
+    with pytest.raises(training.PreprocessingRejectedError, match="broken-window"):
+        training.build_cache(
+            windows,
+            "baroque",
+            "train",
+            amt_settings.control_offset,
+            4,
+            tmp_path / "cache",
+            42,
+            mode="unconditional",
+        )
+    reports = list((tmp_path / "cache").glob("*.diagnostics.json"))
+    assert len(reports) == 1
+    import json
+    report = json.loads(reports[0].read_text())
+    assert report["invalid_windows"] == 1
+    assert report["failures_by_style_objective_reason"] == {
+        "baroque|unconditional|ValueError: synthetic malformed MIDI": 1
+    }
+    assert report["invalid_examples"][0]["window_id"] == "broken-window"
+    assert report["invalid_window_policy"] == training.INVALID_WINDOW_POLICY
+    assert not list((tmp_path / "cache").glob("*.pkl"))
+
+
+def test_preprocessing_summary_counts_empty_masked_and_overflow_failures():
+    from model.training.train_lora import summarize_preprocessing
+
+    report = summarize_preprocessing(
+        [],
+        [
+            {
+                "style": "baroque", "objective": "conditioned",
+                "category": "empty", "empty_windows": 1,
+            },
+            {
+                "style": "baroque", "objective": "conditioned",
+                "category": "all_masked", "all_masked_examples": 2,
+            },
+            {
+                "style": "baroque",
+                "objective": "conditioned",
+                "category": "context_overflow",
+            },
+        ],
+        source_windows=3,
+        mode="conditioned",
+    )
+    assert report["empty_windows"] == 1
+    assert report["all_masked_examples"] == 2
+    assert report["context_overflows"] == 1
+    assert report["invalid_windows"] == 3
+
+
+def test_load_cached_enforces_preprocessing_policy(monkeypatch, tmp_path, amt_settings):
+    import pickle
+    import model.training.train_lora as training
+
+    monkeypatch.setattr(training, "_sequence_settings", lambda _offset: amt_settings)
+    source = tmp_path / "source.mid"
+    source.write_bytes(b"test MIDI")
+    windows = [{
+        "midi_path": str(source), "start_sec": 0.0,
+        "end_sec": 2.0, "window_id": "excluded-window",
+    }]
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir()
+    cache_path = training._cache_path(
+        cache_dir, "baroque", "train", 42, windows,
+        amt_settings.control_offset, 4,
+    )
+    with cache_path.open("wb") as cache_file:
+        pickle.dump({
+            "schema": training.CACHE_SCHEMA,
+            "settings": {
+                "invalid_window_policy": training.INVALID_WINDOW_POLICY,
+            },
+            "diagnostics": {
+                "invalid_windows": 1,
+                "empty_windows": 0,
+                "all_masked_examples": 0,
+                "invalid_examples": [{
+                    "window_id": "excluded-window",
+                    "reason": "malformed MIDI",
+                }],
+            },
+            "samples": [("would-be-silent-partial-cache",)],
+        }, cache_file)
+
+    with pytest.raises(training.PreprocessingRejectedError, match="rejected windows"):
+        training.load_cached(
+            cache_dir,
+            "baroque",
+            "train",
+            42,
+            windows,
+            amt_settings.control_offset,
+            4,
+        )
+    report_path = cache_path.with_suffix(".diagnostics.json")
+    assert report_path.is_file()
+    assert "excluded-window" in report_path.read_text()
+
+
+def test_nll_preparation_uses_configured_context_and_stable_chunk_ids(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setitem(sys.modules, "torch", types.ModuleType("torch"))
+    module = importlib.import_module("model.evaluation.nll_eval")
+    training = importlib.import_module("model.training.train_lora")
+    midi = tmp_path / "midi.mid"
+    midi.write_bytes(b"not parsed by this unit test")
+    called = {}
+
+    def tokenize(_row, *_args, **kwargs):
+        called["context_groups"] = kwargs["context_groups"]
+        return [
+            ([1, 2, 3, 4], [-100, 2, 3, 4], [1, 1, 1, 1]),
+            ([1, 5, 6, 7], [-100, 5, 6, 7], [1, 1, 1, 1]),
+        ]
+
+    monkeypatch.setattr(training, "_load_performance_notes", lambda _path: [])
+    monkeypatch.setattr(training, "_tokenise_window", tokenize)
+    prepared = module.prepare_examples(
+        [{
+            "midi_path": str(midi), "start_sec": 0.0,
+            "end_sec": 1.0, "window_id": "window-17",
+        }],
+        control_offset=100,
+        seq_len=4,
+        mode="conditioned",
+        context_groups=7,
+    )
+    assert called["context_groups"] == 7
+    assert all(
+        row["example_id"].startswith("window-17::")
+        for row in prepared
+    )
+    assert [row["example_id"].rsplit("::", 1)[-1] for row in prepared] == [
+        "chunk-00000",
+        "chunk-00001",
+    ]
+    assert [row["chunk_id"] for row in prepared] == [0, 1]
+    repeated = module.prepare_examples(
+        [{
+            "midi_path": str(midi), "start_sec": 0.0,
+            "end_sec": 1.0, "window_id": "window-17",
+        }],
+        control_offset=100,
+        seq_len=4,
+        mode="conditioned",
+        context_groups=7,
+    )
+    assert [row["example_id"] for row in repeated] == [
+        row["example_id"] for row in prepared
+    ]
+
+
+def test_nll_model_failure_rejects_incomplete_paired_comparison(monkeypatch):
+    torch_stub = types.ModuleType("torch")
+    torch_stub.tensor = lambda value, **_kwargs: value
+    monkeypatch.setitem(sys.modules, "torch", torch_stub)
+    module = importlib.import_module("model.evaluation.nll_eval")
+
+    def fail_model(*_args, **_kwargs):
+        raise RuntimeError("model forward failed")
+
+    monkeypatch.setattr(module, "_nll_decomposed", fail_model)
+    example = {
+        "example_id": "window-2::chunk-00001",
+        "window_id": "window-2",
+        "chunk_id": 1,
+        "ids": [1, 2, 3, 4],
+        "labels": [-100, 2, 3, 4],
+        "attention": [1, 1, 1, 1],
+        "valid_tokens": 3,
+    }
+    with pytest.raises(
+        module.IncompleteComparisonError,
+        match=r"model-A failed on window-2::chunk-00001; comparison incomplete",
+    ):
+        module.score_prepared_examples(object(), [example], "cpu", "model-A")
+
+
+def test_nll_pairing_rejects_different_example_ids():
+    module = importlib.import_module("model.evaluation.nll_eval")
+    with pytest.raises(module.IncompleteComparisonError, match="identical ordered IDs"):
+        module.require_matching_examples(
+            [{"example_id": "w1::chunk-0"}],
+            [{"example_id": "w2::chunk-0"}],
+            "adapter",
+        )
+
+
+def test_renderer_uses_selected_soundfont_and_preserves_safe_level(tmp_path):
+    import numpy as np
+    from scipy.io import wavfile
+    from model.amt_utils import render_wav
+
+    soundfont = tmp_path / "chosen.sf2"
+    soundfont.write_bytes(b"soundfont fixture")
+    calls = {}
+
+    class FakeMidi:
+        def fluidsynth(self, fs, sf2_path):
+            calls.update(sample_rate=fs, soundfont=sf2_path)
+            return np.array([0.0, 0.25, -0.25], dtype=np.float32)
+
+    output = tmp_path / "selected.wav"
+    result = render_wav(
+        FakeMidi(),
+        str(output),
+        sr=22050,
+        soundfont_path=str(soundfont),
+        backend="fluidsynth",
+    )
+    assert result.success
+    assert result.backend == "fluidsynth"
+    assert result.soundfont == str(soundfont.resolve())
+    assert calls == {"sample_rate": 22050, "soundfont": str(soundfont)}
+    rate, pcm = wavfile.read(output)
+    assert rate == 22050
+    assert pcm.dtype == np.int16
+    assert np.max(np.abs(pcm)) == pytest.approx(round(0.25 * 32767), abs=1)
+
+
+def test_renderer_failure_is_visible_and_never_falls_back_to_numpy(tmp_path):
+    from model.amt_utils import render_wav
+
+    class BrokenMidi:
+        def fluidsynth(self, **_kwargs):
+            raise RuntimeError("fluidsynth unavailable")
+
+    output = tmp_path / "must-not-exist.wav"
+    result = render_wav(BrokenMidi(), str(output), backend="fluidsynth")
+    assert not result.success
+    assert result.backend == "fluidsynth"
+    assert "fluidsynth unavailable" in result.error
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    "audio, message",
+    [
+        ([], "empty audio"),
+        ([0.0, 0.0], "silent audio"),
+        ([float("nan")], "non-finite audio"),
+    ],
+)
+def test_renderer_rejects_invalid_audio(tmp_path, audio, message):
+    from model.amt_utils import render_wav
+
+    class FakeMidi:
+        def fluidsynth(self, **_kwargs):
+            return audio
+
+    result = render_wav(FakeMidi(), str(tmp_path / "invalid.wav"))
+    assert not result.success
+    assert message in result.error
+
+
+def test_explicit_numpy_renderer_is_labeled_and_non_silent(tmp_path):
+    import pretty_midi
+    import numpy as np
+    from scipy.io import wavfile
+    from model.amt_utils import render_wav
+
+    pm = pretty_midi.PrettyMIDI()
+    instrument = pretty_midi.Instrument(program=0)
+    instrument.notes.append(
+        pretty_midi.Note(velocity=70, pitch=60, start=0, end=0.1)
+    )
+    pm.instruments.append(instrument)
+    path = tmp_path / "fallback.wav"
+    result = render_wav(pm, str(path), sr=8000, backend="numpy")
+    rate, audio = wavfile.read(path)
+    assert result.success and result.backend == "numpy"
+    assert result.soundfont == "not-used"
+    assert rate == 8000 and np.any(audio)
+
+
+def test_melody_balance_is_one_to_one_and_preserves_raw_midi():
+    import pretty_midi
+    from model.amt_utils import balance_melody_accompaniment
+
+    pm = pretty_midi.PrettyMIDI()
+    instrument = pretty_midi.Instrument(program=0)
+    instrument.notes.extend([
+        pretty_midi.Note(velocity=40, pitch=60, start=0, end=0.5),
+        pretty_midi.Note(velocity=50, pitch=60, start=0.001, end=0.501),
+        pretty_midi.Note(velocity=100, pitch=48, start=0, end=0.5),
+    ])
+    pm.instruments.append(instrument)
+    source_before = [
+        (n.start, n.end, n.pitch, n.velocity)
+        for n in instrument.notes
+    ]
+
+    balanced, info = balance_melody_accompaniment(
+        pm,
+        [(0, 0.5, 60), (0, 0.5, 60)],
+        melody_velocity=80,
+        accompaniment_gain=0.5,
+    )
+
+    assert info["melody_notes_expected"] == info["melody_notes_matched"] == 2
+    assert info["transformed_fields"] == ["velocity"]
+    assert [n.velocity for n in balanced.instruments[0].notes] == [80, 80, 50]
+    assert [
+        (n.start, n.end, n.pitch, n.velocity)
+        for n in instrument.notes
+    ] == source_before
+    assert [
+        (n.start, n.end, n.pitch)
+        for n in balanced.instruments[0].notes
+    ] == [(n.start, n.end, n.pitch) for n in instrument.notes]
+
+
+def test_generation_log_distinguishes_partial_audio_failure(tmp_path):
+    import csv
+    from model.generation.generate import GenerationLog
+
+    log_path = tmp_path / "generation_log.csv"
+    log = GenerationLog(str(log_path))
+    log.record(
+        file="layer_c_melody_baroque",
+        layer="layer_c_lora",
+        melody_id="melody",
+        style="baroque",
+        status="partial",
+        audio_status="failed",
+        failure_stage="rendering",
+        render_backend="fluidsynth",
+        soundfont="library-default:TimGM6mb.sf2",
+        error="RuntimeError: missing FluidSynth",
+    )
+    log.save()
+    with log_path.open(newline="") as source:
+        row = next(csv.DictReader(source))
+    assert row["status"] == "partial"
+    assert row["audio_status"] == "failed"
+    assert row["failure_stage"] == "rendering"
+    assert "FluidSynth" in row["error"]
+    assert log.n_failed == 0
+    assert log.n_audio_failed == 1
 
 
 def test_new_training_refuses_to_overwrite_and_legacy_adapter_is_resolvable():

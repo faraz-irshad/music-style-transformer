@@ -32,25 +32,40 @@ def _arguments() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", required=True, help="New or empty output directory")
     parser.add_argument("--seed", type=int, default=42, help="Reproducibility seed")
+    parser.add_argument(
+        "--renderer", choices=("fluidsynth", "numpy"), default="fluidsynth"
+    )
+    parser.add_argument("--soundfont", help="Explicit SoundFont for FluidSynth")
     return parser.parse_args()
 
 
-def _render(path: Path) -> dict[str, object]:
+def _render(path: Path, renderer: str, soundfont: str | None) -> dict[str, object]:
     try:
-        success = bool(render_wav_from_midi(path))
-        error = None if success else "WAV renderer returned failure"
+        result = render_wav_from_midi(path, renderer, soundfont)
     except Exception as exc:
-        success = False
-        error = f"{type(exc).__name__}: {exc}"
-    if not success:
-        print(f"ERROR: could not render {path.name}: {error}", file=sys.stderr)
-    return {"success": success, "error": error}
+        result = {
+            "success": False,
+            "backend": renderer,
+            "soundfont": soundfont or "not-resolved",
+            "path": str(path.with_suffix(".wav")),
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    if not result["success"]:
+        print(f"ERROR: could not render {path.name}: {result['error']}", file=sys.stderr)
+    return result
 
 
-def render_wav_from_midi(path: Path) -> bool:
+def render_wav_from_midi(
+    path: Path, renderer: str = "fluidsynth", soundfont: str | None = None
+) -> dict[str, object]:
     import pretty_midi
 
-    return render_wav(pretty_midi.PrettyMIDI(str(path)), str(path.with_suffix(".wav")))
+    return render_wav(
+        pretty_midi.PrettyMIDI(str(path)),
+        str(path.with_suffix(".wav")),
+        backend=renderer,
+        soundfont_path=soundfont,
+    ).as_dict()
 
 
 def main() -> int:
@@ -96,7 +111,9 @@ def main() -> int:
         melody, [], "baroque", str(source_midi), args.tempo,
         args.beats_per_bar, args.downbeat_sec,
     )
-    rendering = {"source_melody.wav": _render(source_midi)}
+    rendering = {
+        "source_melody.wav": _render(source_midi, args.renderer, args.soundfont)
+    }
 
     for style, stem in (
         ("baroque", "layer_a_baroque"),
@@ -121,7 +138,7 @@ def main() -> int:
             args.beats_per_bar,
             args.downbeat_sec,
         )
-        rendering[f"{stem}.wav"] = _render(midi_path)
+        rendering[f"{stem}.wav"] = _render(midi_path, args.renderer, args.soundfont)
 
     metadata = {
         "input_melody": str(melody_path),
@@ -132,6 +149,8 @@ def main() -> int:
         "estimated_key": plan.key,
         "mode": plan.mode,
         "harmonic_plan": plan.as_dict(),
+        "renderer": args.renderer,
+        "soundfont": args.soundfont or "library-default",
         "rendering": rendering,
     }
     metadata_path = output_dir / "preview_metadata.json"

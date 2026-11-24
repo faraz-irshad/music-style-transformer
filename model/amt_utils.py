@@ -12,6 +12,8 @@ UNVERIFIED items (require Colab run to confirm):
 from __future__ import annotations
 import os
 import tempfile
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -144,17 +146,27 @@ def save_midi_file(pm_or_mido, path: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Pure-numpy WAV synthesiser (fallback when fluidsynth is unavailable)
+# WAV rendering
 # ---------------------------------------------------------------------------
 
-def synthesise_wav_numpy(pm, path: str, sr: int = 22050) -> None:
-    """
-    Render a pretty_midi.PrettyMIDI to WAV using a simple additive sine
-    synthesiser. Quality is low but sufficient for demo purposes.
-    Does not require fluidsynth or pyfluidsynth.
-    """
+@dataclass(frozen=True)
+class WavRenderResult:
+    success: bool
+    backend: str
+    soundfont: str
+    path: str
+    error: str = ""
+
+    def __bool__(self) -> bool:
+        return self.success
+
+    def as_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+def _synthesise_audio_numpy(pm, sr: int):
+    """Return additive-sine audio for an explicitly selected fallback backend."""
     import numpy as np
-    import scipy.io.wavfile as wf
 
     duration = pm.get_end_time()
     if duration <= 0:
@@ -184,29 +196,148 @@ def synthesise_wav_numpy(pm, path: str, sr: int = 22050) -> None:
             vel = (note.velocity / 127.0) * 0.15
             audio[start:end] += np.sin(2 * np.pi * freq * t) * env * vel
 
-    # Normalise
-    peak = np.abs(audio).max()
-    if peak > 0:
-        audio = audio / peak * 0.9
-    wf.write(path, sr, (audio * 32767).astype(np.int16))
+    return audio
 
 
-def render_wav(pm, path: str, sr: int = 44100) -> bool:
-    """
-    Render a pretty_midi.PrettyMIDI to WAV.
-    Tries fluidsynth first; falls back to pure-numpy synthesiser.
-    Returns True on success.
-    """
+def _write_wav(audio, path: str, sr: int) -> None:
+    import numpy as np
+    import scipy.io.wavfile as wf
+    import uuid
+
+    samples = np.asarray(audio, dtype=np.float64).reshape(-1)
+    if samples.size == 0:
+        raise ValueError("renderer produced empty audio")
+    if not np.isfinite(samples).all():
+        raise ValueError("renderer produced non-finite audio")
+    peak = float(np.max(np.abs(samples)))
+    if peak <= 1e-8:
+        raise ValueError("renderer produced silent audio")
+    if peak > 1.0:
+        samples = samples / peak
+    pcm = np.rint(samples * 32767).clip(-32768, 32767).astype(np.int16)
+    if not np.any(pcm):
+        raise ValueError("renderer produced silent int16 audio")
+    destination = Path(path)
+    temporary = destination.with_name(
+        f".{destination.name}.{uuid.uuid4().hex}.tmp.wav"
+    )
     try:
-        audio = pm.fluidsynth(fs=sr)
-        import numpy as np, scipy.io.wavfile as wf
-        wf.write(path, sr, (audio * 32767).astype(np.int16))
-        return True
-    except Exception:
-        pass
+        wf.write(str(temporary), sr, pcm)
+        os.replace(temporary, destination)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+
+def synthesise_wav_numpy(pm, path: str, sr: int = 22050) -> None:
+    """Render additive-sine WAV; callers must explicitly select this backend."""
+    _write_wav(_synthesise_audio_numpy(pm, sr), path, sr)
+
+
+def render_wav(
+    pm,
+    path: str,
+    sr: int = 44100,
+    soundfont_path: str | None = None,
+    backend: str = "fluidsynth",
+) -> WavRenderResult:
+    """Render with the selected backend and return its explicit outcome."""
+    if backend not in ("fluidsynth", "numpy"):
+        raise ValueError("backend must be 'fluidsynth' or 'numpy'")
+    if sr <= 0:
+        raise ValueError("sample rate must be positive")
+    if backend == "numpy" and soundfont_path is not None:
+        raise ValueError("SoundFont selection applies only to the fluidsynth backend")
+    if soundfont_path is not None and not Path(soundfont_path).is_file():
+        raise FileNotFoundError(f"SoundFont does not exist: {soundfont_path}")
+    if soundfont_path:
+        soundfont = str(Path(soundfont_path).resolve())
+    elif backend == "fluidsynth":
+        try:
+            import pretty_midi.fluidsynth as fluidsynth
+            soundfont = f"library-default:{fluidsynth.DEFAULT_SF2}"
+        except Exception:
+            soundfont = "library-default:unresolved"
+    else:
+        soundfont = "not-used"
     try:
-        synthesise_wav_numpy(pm, path, sr=sr)
-        return True
-    except Exception as e:
-        print(f"  WAV render failed entirely for {path}: {e}")
-        return False
+        if backend == "fluidsynth":
+            audio = pm.fluidsynth(fs=sr, sf2_path=soundfont_path)
+        else:
+            audio = _synthesise_audio_numpy(pm, sr)
+        _write_wav(audio, path, sr)
+        return WavRenderResult(True, backend, soundfont, str(path))
+    except Exception as exc:
+        return WavRenderResult(
+            False, backend, soundfont, str(path),
+            f"{type(exc).__name__}: {exc}",
+        )
+
+
+def balance_melody_accompaniment(
+    pm,
+    melody_notes: list[tuple[float, float, int]],
+    melody_velocity: int = 80,
+    accompaniment_gain: float = 0.55,
+    onset_tolerance_sec: float = 0.03,
+    duration_tolerance_sec: float = 0.05,
+) -> tuple[object, dict[str, object]]:
+    """Return a velocity-balanced copy; source timing and pitches are untouched."""
+    import copy
+    import math
+
+    if not 1 <= melody_velocity <= 127:
+        raise ValueError("melody_velocity must be in [1, 127]")
+    if not math.isfinite(accompaniment_gain) or not 0 <= accompaniment_gain <= 1:
+        raise ValueError("accompaniment_gain must be finite and in [0, 1]")
+    if (
+        not math.isfinite(onset_tolerance_sec)
+        or not math.isfinite(duration_tolerance_sec)
+        or onset_tolerance_sec < 0
+        or duration_tolerance_sec < 0
+    ):
+        raise ValueError("matching tolerances must be finite and non-negative")
+
+    balanced = copy.deepcopy(pm)
+    generated = [
+        note
+        for instrument in balanced.instruments
+        if not instrument.is_drum
+        for note in instrument.notes
+    ]
+    unmatched = set(range(len(generated)))
+    matched = 0
+    for start, end, pitch in sorted(melody_notes):
+        candidates = [
+            index for index in unmatched
+            if generated[index].pitch == pitch
+            and abs(generated[index].start - start) <= onset_tolerance_sec
+            and abs(generated[index].end - end) <= duration_tolerance_sec
+        ]
+        if not candidates:
+            continue
+        index = min(
+            candidates,
+            key=lambda i: (
+                abs(generated[i].start - start)
+                + abs(generated[i].end - end),
+                i,
+            ),
+        )
+        generated[index].velocity = melody_velocity
+        unmatched.remove(index)
+        matched += 1
+    for index in unmatched:
+        generated[index].velocity = max(
+            0, min(127, round(generated[index].velocity * accompaniment_gain))
+        )
+    return balanced, {
+        "enabled": True,
+        "melody_notes_expected": len(melody_notes),
+        "melody_notes_matched": matched,
+        "melody_velocity": melody_velocity,
+        "accompaniment_gain": accompaniment_gain,
+        "onset_tolerance_sec": onset_tolerance_sec,
+        "duration_tolerance_sec": duration_tolerance_sec,
+        "transformed_fields": ["velocity"],
+    }

@@ -13,6 +13,7 @@ def generate_conditioned(
     top_p: float = 1.0,
     debug: bool = False,
     delta: int | None = None,
+    max_events: int = 100_000,
 ) -> list[int]:
     """Generate while retaining time-zero and other nonnegative controls.
 
@@ -42,6 +43,8 @@ def generate_conditioned(
         delta = DELTA * TIME_RESOLUTION
     if delta < 0:
         raise ValueError("anticipation delta must be non-negative")
+    if isinstance(max_events, bool) or not isinstance(max_events, int) or max_events <= 0:
+        raise ValueError("max_events must be a positive integer")
 
     start_tick = int(TIME_RESOLUTION * start_time)
     end_tick = int(TIME_RESOLUTION * end_time)
@@ -91,6 +94,7 @@ def generate_conditioned(
         atime = adur = anote = 0
         anticipated_tokens = []
 
+    event_count = 0
     while current_time < end_tick:
         while current_time >= anticipated_time - delta:
             tokens.extend((atime, adur, anote))
@@ -101,9 +105,16 @@ def generate_conditioned(
             else:
                 anticipated_time = math.inf
 
+        if event_count >= max_events:
+            raise RuntimeError(
+                f"generation event budget exhausted after {event_count} events "
+                f"at time {current_time} ticks before requested endpoint "
+                f"{end_tick} ticks"
+            )
         generated = add_token(
             model, mode, tokens, top_p, max(start_tick, current_time), debug
         )
+        event_count += 1
         if len(generated) != 3:
             raise ValueError("Anticipation sampler must return one three-token event")
         generated_time = generated[0] - TIME_OFFSET

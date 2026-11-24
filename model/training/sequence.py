@@ -4,8 +4,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
-CACHE_SCHEMA = "anticipatory-sequence-v7"
-SEQUENCE_POLICY = "anticipation-v1-context-170-required-controls"
+CACHE_SCHEMA = "anticipatory-sequence-v9"
+SEQUENCE_POLICY = "anticipation-v1-context-bounded-generation-history"
+INVALID_WINDOW_POLICY = "fail-on-any-window-error-empty-or-all-masked-v1"
 
 
 @dataclass(frozen=True)

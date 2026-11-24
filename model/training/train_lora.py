@@ -25,7 +25,9 @@ import yaml
 
 from model.training.sequence import (
     CACHE_SCHEMA,
+    INVALID_WINDOW_POLICY,
     SEQUENCE_POLICY,
+    ContextOverflowError,
     SequenceSettings,
     UnconsumedControlsError,
     chunk_sequence,
@@ -59,13 +61,14 @@ def _build_anticipatory_sequence(
     control_offset: int,
 ) -> tuple[list[int], list[int]]:
     """
-    Build an anticipatory interleaved sequence using the anticipation library's
-    own routine so the training format matches what generate() expects.
+    Compatibility helper for Anticipation's upstream anticipate ordering.
 
     anticipation.ops.anticipate returns (interleaved_tokens,
     unconsumed_controls). Controls are masked from the training loss.
 
-    Returns (input_ids, labels).
+    Production window tokenisation uses the same predecessor-event criterion
+    as this compatibility helper because the sampler's current time is the
+    preceding generated event before its next model call.
     """
     settings = _sequence_settings(control_offset)
     interleaved, remaining = interleave_anticipated_controls(
@@ -140,6 +143,7 @@ def _tokenise_window_with_stats(
     mode: str = "mixed",
     context_groups: int = 170,
 ) -> tuple[list[tuple[list[int], list[int], list[int]]], dict]:
+    """Tokenise targets with controls visible at the same sampler time as inference."""
     from anticipation.vocab import ANTICIPATE, AUTOREGRESS
     from model.data.skyline import skyline, Note as SNote
 
@@ -238,13 +242,18 @@ def _cache_path(
     mode: str = "mixed",
     anticipatory_prob: float = 0.5,
     context_groups: int = 170,
+    source_fingerprints: dict[str, str] | None = None,
+    invalid_window_policy: str = INVALID_WINDOW_POLICY,
 ) -> Path:
+    if source_fingerprints is None:
+        source_fingerprints = _source_fingerprints(windows)
     signature = [
         (
             row["midi_path"],
             float(row["start_sec"]),
             float(row["end_sec"]),
             row.get("window_id", ""),
+            source_fingerprints[str(row["midi_path"])],
         )
         for row in windows
     ]
@@ -262,11 +271,42 @@ def _cache_path(
         "mode": mode,
         "anticipatory_prob": anticipatory_prob,
         "context_groups": context_groups,
+        "invalid_window_policy": invalid_window_policy,
         "window_signature": signature,
     }
     payload = json.dumps(settings, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(payload.encode()).hexdigest()[:16]
     return cache_dir / f"{style}_{split}_{digest}_{CACHE_SCHEMA}.pkl"
+
+
+def _source_fingerprints(windows: list[dict]) -> dict[str, str]:
+    """Hash each distinct source MIDI once, so same-path edits invalidate caches."""
+    fingerprints = {}
+    for row in windows:
+        path = str(row["midi_path"])
+        if path in fingerprints:
+            continue
+        digest = hashlib.sha256()
+        try:
+            with open(path, "rb") as source:
+                for block in iter(lambda: source.read(1024 * 1024), b""):
+                    digest.update(block)
+        except OSError as exc:
+            fingerprints[path] = f"unreadable:{type(exc).__name__}:{exc}"
+        else:
+            fingerprints[path] = digest.hexdigest()
+    return fingerprints
+
+
+class PreprocessingRejectedError(ValueError):
+    """Raised after a diagnostic report records rejected dataset windows."""
+
+
+def _write_preprocessing_report(path: Path, diagnostics: dict) -> None:
+    path.write_text(
+        json.dumps(diagnostics, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 def build_cache(
@@ -281,18 +321,40 @@ def build_cache(
     mode: str = "mixed",
     anticipatory_prob: float = 0.5,
     context_groups: int = 170,
+    invalid_window_policy: str = INVALID_WINDOW_POLICY,
 ) -> dict:
     """Cache examples without mutating or reusing an incompatible old schema."""
+    if invalid_window_policy != INVALID_WINDOW_POLICY:
+        raise ValueError(
+            f"unsupported invalid_window_policy {invalid_window_policy!r}; "
+            f"only {INVALID_WINDOW_POLICY!r} is allowed"
+        )
     cache_dir.mkdir(parents=True, exist_ok=True)
+    source_fingerprints = _source_fingerprints(windows)
     cp = _cache_path(
         cache_dir, style, split, seed, windows, control_offset, seq_len,
         mode, anticipatory_prob, context_groups,
+        source_fingerprints=source_fingerprints,
+        invalid_window_policy=invalid_window_policy,
     )
+    report_path = cp.with_suffix(".diagnostics.json")
     if cp.exists():
         with cp.open("rb") as handle:
             cached = pickle.load(handle)
         if cached.get("schema") != CACHE_SCHEMA:
             raise ValueError(f"incompatible cache schema in {cp}")
+        diagnostics = cached["diagnostics"]
+        if (
+            diagnostics.get("invalid_windows", 0)
+            or diagnostics.get("empty_windows", 0)
+            or diagnostics.get("all_masked_examples", 0)
+            or cached.get("settings", {}).get("invalid_window_policy")
+            != invalid_window_policy
+        ):
+            _write_preprocessing_report(report_path, diagnostics)
+            raise PreprocessingRejectedError(
+                f"cached preprocessing rejected windows; report: {report_path}"
+            )
         return cached["diagnostics"]
     rng = random.Random(seed)
     shuffled_windows = list(windows)
@@ -314,6 +376,7 @@ def build_cache(
     invalid_windows = []
     cache_started = time.perf_counter()
     for window_index, row in enumerate(shuffled_windows, start=1):
+        stats = None
         try:
             midi_path = str(row["midi_path"])
             if midi_path not in performance_cache:
@@ -324,11 +387,32 @@ def build_cache(
                 shift=shift, performance_notes=performance_cache[midi_path],
                 mode=mode, context_groups=context_groups,
             )
+            if stats.get("empty"):
+                raise ValueError("window produced no training examples")
+            if stats.get("all_masked_examples"):
+                raise ValueError("window produced all-masked training examples")
             samples.extend(row_examples)
             window_stats.append(stats)
         except Exception as exc:
+            if isinstance(exc, ContextOverflowError):
+                category = "context_overflow"
+            elif stats and stats.get("empty"):
+                category = "empty"
+            elif stats and stats.get("all_masked_examples"):
+                category = "all_masked"
+            else:
+                category = "unexpected"
             invalid = {
                 "window_id": row.get("window_id", ""),
+                "style": style,
+                "objective": mode,
+                "category": category,
+                "error_type": type(exc).__name__,
+                "empty_windows": int(bool(stats and stats.get("empty"))),
+                "all_masked_examples": int(
+                    (stats or {}).get("all_masked_examples", 0)
+                ),
+                "reason": f"{type(exc).__name__}: {exc}",
                 "error": f"{type(exc).__name__}: {exc}",
                 "unconsumed_controls": (
                     exc.count if isinstance(exc, UnconsumedControlsError) else 0
@@ -352,6 +436,18 @@ def build_cache(
         window_stats, invalid_windows, len(shuffled_windows), mode
     )
     diagnostics["cache_identity"] = cp.stem
+    diagnostics["invalid_window_policy"] = invalid_window_policy
+    diagnostics["style"] = style
+    diagnostics["objective"] = mode
+    _write_preprocessing_report(report_path, diagnostics)
+    if diagnostics["invalid_windows"]:
+        rejected_ids = [
+            str(entry.get("window_id", "?")) for entry in invalid_windows
+        ]
+        raise PreprocessingRejectedError(
+            f"preprocessing rejected {diagnostics['invalid_windows']} "
+            f"{style}/{mode} window(s) {rejected_ids}; report: {report_path}"
+        )
     payload = {
         "schema": CACHE_SCHEMA,
         "settings": {
@@ -360,6 +456,7 @@ def build_cache(
             "context_groups": context_groups,
             "sequence_length": seq_len,
             "seed": seed,
+            "invalid_window_policy": invalid_window_policy,
         },
         "diagnostics": diagnostics,
         "samples": samples,
@@ -377,6 +474,14 @@ def summarize_preprocessing(
     mode: str,
 ) -> dict:
     examples = sum(int(stats.get("produced_examples", 0)) for stats in window_stats)
+    failure_counts: dict[str, int] = {}
+    for failure in invalid_windows:
+        key = "|".join((
+            str(failure.get("style", "")),
+            str(failure.get("objective", mode)),
+            str(failure.get("reason", "unknown")),
+        ))
+        failure_counts[key] = failure_counts.get(key, 0) + 1
     return {
         "mode": mode,
         "source_windows": source_windows,
@@ -424,9 +529,17 @@ def summarize_preprocessing(
             int(stats.get("truncated_groups", 0) > 0) for stats in window_stats
         ),
         "invalid_windows": len(invalid_windows),
-        "empty_windows": sum(bool(stats.get("empty")) for stats in window_stats),
+        "failures_by_style_objective_reason": failure_counts,
+        "empty_windows": sum(bool(stats.get("empty")) for stats in window_stats)
+        + sum(int(entry.get("empty_windows", 0)) for entry in invalid_windows),
         "all_masked_examples": sum(
             int(stats.get("all_masked_examples", 0)) for stats in window_stats
+        ) + sum(
+            int(entry.get("all_masked_examples", 0)) for entry in invalid_windows
+        ),
+        "context_overflows": sum(
+            entry.get("category") == "context_overflow"
+            for entry in invalid_windows
         ),
         "invalid_examples": invalid_windows,
     }
@@ -443,16 +556,36 @@ def load_cached(
     mode: str = "mixed",
     anticipatory_prob: float = 0.5,
     context_groups: int = 170,
+    invalid_window_policy: str = INVALID_WINDOW_POLICY,
 ) -> list[tuple]:
     """Load cached samples for a style/split."""
+    if invalid_window_policy != INVALID_WINDOW_POLICY:
+        raise ValueError(
+            f"unsupported invalid_window_policy {invalid_window_policy!r}; "
+            f"only {INVALID_WINDOW_POLICY!r} is allowed"
+        )
     cp = _cache_path(
         cache_dir, style, split, seed, windows, control_offset, seq_len,
         mode, anticipatory_prob, context_groups,
+        invalid_window_policy=invalid_window_policy,
     )
     with cp.open("rb") as handle:
         cached = pickle.load(handle)
     if cached.get("schema") != CACHE_SCHEMA:
         raise ValueError(f"incompatible cache schema in {cp}")
+    diagnostics = cached.get("diagnostics", {})
+    if (
+        diagnostics.get("invalid_windows", 0)
+        or diagnostics.get("empty_windows", 0)
+        or diagnostics.get("all_masked_examples", 0)
+        or cached.get("settings", {}).get("invalid_window_policy")
+        != INVALID_WINDOW_POLICY
+    ):
+        report_path = cp.with_suffix(".diagnostics.json")
+        _write_preprocessing_report(report_path, diagnostics)
+        raise PreprocessingRejectedError(
+            f"cached preprocessing rejected windows; report: {report_path}"
+        )
     return cached["samples"]
 
 
@@ -629,6 +762,9 @@ def train(
     grad_accum = tcfg["grad_accum"]
     save_every = tcfg["save_every"]
     control_offset = acfg.CONTROL_OFFSET
+    invalid_window_policy = tcfg.get(
+        "invalid_window_policy", INVALID_WINDOW_POLICY
+    )
     print(f"CONTROL_OFFSET = {control_offset}")
 
     # Data
@@ -655,6 +791,7 @@ def train(
         seed, performance_cache, mode="mixed",
         anticipatory_prob=tcfg.get("anticipatory_prob", 0.5),
         context_groups=tcfg.get("context_groups", 170),
+        invalid_window_policy=invalid_window_policy,
     )
     print(f"  Training preprocessing: {json.dumps(training_diagnostics, sort_keys=True)}")
     val_diagnostics = {}
@@ -665,17 +802,20 @@ def train(
             seed, performance_cache, mode=validation_mode,
             anticipatory_prob=0.0,
             context_groups=tcfg.get("context_groups", 170),
+            invalid_window_policy=invalid_window_policy,
         )
         val_samples_by_mode[validation_mode] = load_cached(
             cache_dir, style, "val", seed, val_windows, control_offset, seq_len,
             mode=validation_mode, anticipatory_prob=0.0,
             context_groups=tcfg.get("context_groups", 170),
+            invalid_window_policy=invalid_window_policy,
         )
     print(f"Token cache build/check time: {time.perf_counter() - cache_started:.1f}s")
     train_samples = load_cached(
         cache_dir, style, "train", seed, train_windows, control_offset, seq_len,
         mode="mixed", anticipatory_prob=tcfg.get("anticipatory_prob", 0.5),
         context_groups=tcfg.get("context_groups", 170),
+        invalid_window_policy=invalid_window_policy,
     )
     if not train_samples:
         raise ValueError(f"No supervised training examples for {style}; see diagnostics")
@@ -869,6 +1009,7 @@ def _check_skyline_dominance(model, windows, control_offset, seq_len, device):
             output = generate_conditioned(
                 model, start_time=0, end_time=max(n.end for n in mel),
                 inputs=[], controls=controls, top_p=0.95,
+                max_events=100_000,
             )
         model.train()
 

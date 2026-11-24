@@ -34,12 +34,15 @@ training:
   experiment_name: "neural_alignment_v1"
   anticipatory_prob: 0.5
   context_groups: 170
+  invalid_window_policy: "fail-on-any-window-error-empty-or-all-masked-v1"
   # Null evaluates every deterministic validation example.
   validation_max_examples: null
   drive_dir: "/content/drive/MyDrive/thesis_adapters"
 
 generation:
   top_p: 0.95
+  # Maximum sampled event groups per melody; exhaustion is a logged failure.
+  max_events: 100000
   # max_new_tokens: not currently used by generate.py (end_time controls length)
   max_new_tokens: 1024
   random_seed: 42
@@ -53,3 +56,14 @@ evaluation:
   nll_test_max_windows: null
   bootstrap_n: 1000
   classifier_C: 1.0
+
+rendering:
+  backend: "fluidsynth"
+  soundfont_path: null
+  sample_rate: 44100
+  # Explicitly opt in to labeled *_balanced.wav derivatives.
+  balance_melody_accompaniment: false
+  melody_velocity: 80
+  accompaniment_gain: 0.55
+  onset_tolerance_sec: 0.03
+  duration_tolerance_sec: 0.05

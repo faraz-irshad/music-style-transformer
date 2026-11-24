@@ -45,7 +45,7 @@ def main(config_path: str) -> None:
     gen_rows = []
     with open(gen_log_path) as f:
         for row in csv.DictReader(f):
-            if row["status"] == "ok":
+            if row["status"] in ("ok", "partial"):
                 gen_rows.append(row)
 
     # Load evaluation results if available
