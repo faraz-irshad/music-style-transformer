@@ -875,6 +875,182 @@ def test_load_cached_enforces_preprocessing_policy(monkeypatch, tmp_path, amt_se
     assert "excluded-window" in report_path.read_text()
 
 
+def _write_explicit_cache(cache_dir, style, split, mode, seed=42, seq_len=7,
+                          anticipatory_prob=0.0, context_groups=2,
+                          variant=""):
+    import pickle
+    import model.training.train_lora as training
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    stem = f"{style}_{split}_{mode}{variant}_{training.CACHE_SCHEMA}"
+    cache_path = cache_dir / f"{stem}.pkl"
+    ids = [40000, 1, 2, 3, 4, 5, 1005]
+    labels = [-100, 1, 2, 3, -100, -100, -100]
+    attention = [1] * seq_len
+    payload = {
+        "schema": training.CACHE_SCHEMA,
+        "settings": {
+            "mode": mode,
+            "anticipatory_prob": anticipatory_prob,
+            "context_groups": context_groups,
+            "sequence_length": seq_len,
+            "seed": seed,
+            "invalid_window_policy": training.INVALID_WINDOW_POLICY,
+        },
+        "diagnostics": {
+            "cache_identity": cache_path.stem,
+            "style": style,
+            "objective": mode,
+            "mode": mode,
+            "source_windows": 1,
+            "valid_windows": 1,
+            "produced_examples": 1,
+            "invalid_windows": 0,
+            "empty_windows": 0,
+            "all_masked_examples": 0,
+            "invalid_window_policy": training.INVALID_WINDOW_POLICY,
+        },
+        "samples": [(ids, labels, attention)],
+    }
+    with cache_path.open("wb") as handle:
+        pickle.dump(payload, handle)
+    return cache_path
+
+
+def test_explicit_cache_load_is_manifest_and_source_independent(
+    monkeypatch, tmp_path
+):
+    import model.training.train_lora as training
+
+    cache_path = _write_explicit_cache(
+        tmp_path, "baroque", "train", "mixed", anticipatory_prob=0.5
+    )
+    monkeypatch.setattr(
+        training, "_source_fingerprints",
+        lambda _windows: (_ for _ in ()).throw(AssertionError("source read")),
+    )
+    samples = training.load_explicit_cache(
+        cache_path, "baroque", "train", "mixed", 42, 7, 0.5, 2, 1000
+    )
+    assert len(samples) == 1
+    assert samples[0][1] == [-100, 1, 2, 3, -100, -100, -100]
+
+
+def test_training_entry_point_cache_only_does_not_require_data_config(
+    monkeypatch, tmp_path
+):
+    import yaml
+    import model.training.train_lora as training
+
+    config_path = tmp_path / "saved-config.yaml"
+    config_path.write_text(yaml.safe_dump({
+        "training": {
+            "drive_dir": str(tmp_path),
+            "experiment_name": "neural_alignment_v1",
+        },
+    }))
+    selection_path = tmp_path / "selection.json"
+    selection_path.write_text("{}")
+    selected = {"schema": training.CACHE_SELECTION_SCHEMA}
+    calls = {}
+    monkeypatch.setattr(training, "_load_cache_selection", lambda *_args: selected)
+    monkeypatch.setattr(
+        training,
+        "train",
+        lambda style, manifest, drive, cfg, **kwargs: calls.update({
+            "style": style, "manifest": manifest, "drive": drive,
+            "cfg": cfg, **kwargs,
+        }),
+    )
+    monkeypatch.setattr(
+        sys, "argv",
+        [
+            "train_lora.py", "--config", str(config_path), "--style", "baroque",
+            "--cache-only", "--cache-selection", str(selection_path),
+        ],
+    )
+    training.main()
+    assert calls["manifest"] is None
+    assert calls["cache_only"] is True
+    assert calls["cache_selection"] is selected
+
+
+def test_explicit_cache_rejects_bad_settings_or_supervision(tmp_path):
+    import pickle
+    import model.training.train_lora as training
+
+    cache_path = _write_explicit_cache(
+        tmp_path, "baroque", "train", "mixed", anticipatory_prob=0.5
+    )
+    with pytest.raises(ValueError, match="incompatible cache settings"):
+        training.load_explicit_cache(
+            cache_path, "baroque", "train", "mixed", 42, 8, 0.5, 2, 1000
+        )
+
+    with cache_path.open("rb") as handle:
+        payload = pickle.load(handle)
+    ids, labels, attention = payload["samples"][0]
+    payload["samples"][0] = (
+        ids, labels[:-1] + [1005], attention,
+    )
+    with cache_path.open("wb") as handle:
+        pickle.dump(payload, handle)
+    with pytest.raises(ValueError, match="control token"):
+        training.load_explicit_cache(
+            cache_path, "baroque", "train", "mixed", 42, 7, 0.5, 2, 1000
+        )
+
+
+def test_cache_discovery_requires_one_matching_cache_for_each_role(
+    monkeypatch, tmp_path
+):
+    import model.training.train_lora as training
+
+    anticipation = types.ModuleType("anticipation")
+    anticipation.__path__ = []
+    vocab = types.ModuleType("anticipation.vocab")
+    vocab.CONTROL_OFFSET = 1000
+    monkeypatch.setitem(sys.modules, "anticipation", anticipation)
+    monkeypatch.setitem(sys.modules, "anticipation.vocab", vocab)
+    cfg = {
+        "training": {
+            "random_seed": 42, "seq_len": 7, "context_groups": 2,
+            "anticipatory_prob": 0.5,
+            "invalid_window_policy": training.INVALID_WINDOW_POLICY,
+            "experiment_name": "neural_alignment_v1",
+        }
+    }
+    for style in ("baroque", "romantic"):
+        _write_explicit_cache(
+            tmp_path, style, "train", "mixed", anticipatory_prob=0.5
+        )
+        _write_explicit_cache(tmp_path, style, "val", "unconditional")
+        _write_explicit_cache(tmp_path, style, "val", "conditioned")
+    selection = training.discover_cache_selection(tmp_path, cfg)
+    assert selection["schema"] == training.CACHE_SELECTION_SCHEMA
+    assert set(selection["entries"]) == {"baroque", "romantic"}
+    assert set(selection["entries"]["baroque"]) == {
+        "train_mixed", "val_unconditional", "val_conditioned",
+    }
+    _write_explicit_cache(
+        tmp_path, "baroque", "train", "mixed", anticipatory_prob=0.5,
+        variant="_duplicate",
+    )
+    with pytest.raises(ValueError, match="expected exactly one"):
+        training.discover_cache_selection(tmp_path, cfg)
+
+
+def test_optimizer_skip_and_causal_attention_count_are_explicit():
+    import model.training.train_lora as training
+
+    assert training._causal_supervised_token_count(
+        [-100, 1, 2, 3], [1, 1, 0, 1]
+    ) == 2
+    with pytest.raises(RuntimeError, match="skipped an optimizer update"):
+        training._assert_scaler_did_not_skip(8.0, 4.0)
+    training._assert_scaler_did_not_skip(8.0, 8.0)
+
+
 def test_nll_preparation_uses_configured_context_and_stable_chunk_ids(
     monkeypatch, tmp_path
 ):

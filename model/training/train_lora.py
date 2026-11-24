@@ -589,6 +589,312 @@ def load_cached(
     return cached["samples"]
 
 
+CACHE_SELECTION_SCHEMA = "neural-alignment-cache-selection-v1"
+
+
+def _explicit_cache_training_settings(tcfg: dict) -> tuple[int, int, float, int]:
+    required = {
+        "random_seed", "seq_len", "context_groups", "anticipatory_prob",
+        "invalid_window_policy",
+    }
+    missing = required - set(tcfg)
+    if missing:
+        raise ValueError(
+            "saved training config is missing explicit cache settings: "
+            f"{sorted(missing)}"
+        )
+    if "experiment_dir" not in tcfg and "experiment_name" not in tcfg:
+        raise ValueError(
+            "saved training config must specify experiment_dir or experiment_name"
+        )
+    if tcfg["invalid_window_policy"] != INVALID_WINDOW_POLICY:
+        raise ValueError(
+            f"unsupported invalid_window_policy "
+            f"{tcfg['invalid_window_policy']!r}; only "
+            f"{INVALID_WINDOW_POLICY!r} is allowed"
+        )
+    return (
+        int(tcfg["random_seed"]),
+        int(tcfg["seq_len"]),
+        float(tcfg["anticipatory_prob"]),
+        int(tcfg["context_groups"]),
+    )
+
+
+def _validate_cached_payload(
+    cached: dict,
+    cache_path: Path,
+    style: str,
+    split: str,
+    mode: str,
+    seed: int,
+    seq_len: int,
+    anticipatory_prob: float,
+    context_groups: int,
+    control_offset: int,
+) -> list[tuple[list[int], list[int], list[int]]]:
+    """Validate a selected cache without consulting a manifest or source MIDI."""
+    expected_prefix = f"{style}_{split}_"
+    expected_suffix = f"_{CACHE_SCHEMA}.pkl"
+    if not cache_path.name.startswith(expected_prefix) or not cache_path.name.endswith(
+        expected_suffix
+    ):
+        raise ValueError(
+            f"cache filename does not identify {style}/{split}: {cache_path}"
+        )
+    if cached.get("schema") != CACHE_SCHEMA:
+        raise ValueError(f"incompatible cache schema in {cache_path}")
+
+    settings = cached.get("settings", {})
+    expected_settings = {
+        "mode": mode,
+        "anticipatory_prob": anticipatory_prob,
+        "context_groups": context_groups,
+        "sequence_length": seq_len,
+        "seed": seed,
+        "invalid_window_policy": INVALID_WINDOW_POLICY,
+    }
+    mismatches = {
+        name: (settings.get(name), expected)
+        for name, expected in expected_settings.items()
+        if settings.get(name) != expected
+    }
+    if mismatches:
+        raise ValueError(
+            f"incompatible cache settings in {cache_path}: {mismatches}"
+        )
+
+    diagnostics = cached.get("diagnostics", {})
+    identity = cache_path.name[:-4]
+    if (
+        diagnostics.get("cache_identity") != identity
+        or diagnostics.get("style") != style
+        or diagnostics.get("objective") != mode
+        or diagnostics.get("mode") != mode
+    ):
+        raise ValueError(
+            f"cache identity/style/objective metadata mismatch in {cache_path}"
+        )
+    if (
+        int(diagnostics.get("source_windows", 0)) <= 0
+        or diagnostics.get("source_windows") != diagnostics.get("valid_windows")
+        or int(diagnostics.get("invalid_windows", 0)) != 0
+        or int(diagnostics.get("empty_windows", 0)) != 0
+        or int(diagnostics.get("all_masked_examples", 0)) != 0
+        or diagnostics.get("invalid_window_policy") != INVALID_WINDOW_POLICY
+    ):
+        raise PreprocessingRejectedError(
+            f"cache contains rejected, empty, or all-masked windows: {cache_path}"
+        )
+
+    samples = cached.get("samples")
+    if not isinstance(samples, list) or not samples:
+        raise ValueError(f"cache has no samples: {cache_path}")
+    if int(diagnostics.get("produced_examples", -1)) != len(samples):
+        raise ValueError(f"cache sample count disagrees with diagnostics: {cache_path}")
+
+    supervised_tokens = 0
+    for sample_index, sample in enumerate(samples):
+        if not isinstance(sample, (tuple, list)) or len(sample) != 3:
+            raise ValueError(f"malformed sample {sample_index} in {cache_path}")
+        ids, labels, attention = sample
+        if not all(
+            isinstance(values, (tuple, list)) and len(values) == seq_len
+            for values in (ids, labels, attention)
+        ):
+            raise ValueError(
+                f"sample {sample_index} does not match sequence length {seq_len}"
+            )
+        if any(not isinstance(token, int) or token < 0 for token in ids):
+            raise ValueError(f"invalid input token in sample {sample_index}")
+        if any(
+            not isinstance(label, int) or (label < 0 and label != -100)
+            for label in labels
+        ):
+            raise ValueError(f"invalid label in sample {sample_index}")
+        if any(mask not in (0, 1) for mask in attention):
+            raise ValueError(f"invalid attention mask in sample {sample_index}")
+        if any(label != -100 and not mask for label, mask in zip(labels, attention)):
+            raise ValueError(
+                f"sample {sample_index} supervises an attention-masked token"
+            )
+        if labels[0] != -100:
+            raise ValueError(f"sample {sample_index} supervises its mode token")
+        if any(
+            label != -100 and label >= control_offset
+            for label in labels
+        ):
+            raise ValueError(f"sample {sample_index} supervises a control token")
+        if any(
+            label != -100 and label != token
+            for label, token in zip(labels, ids)
+        ):
+            raise ValueError(f"sample {sample_index} labels do not match input tokens")
+        for index in range(1, seq_len - 2, 3):
+            if ids[index + 2] >= control_offset and any(
+                label != -100 for label in labels[index:index + 3]
+            ):
+                raise ValueError(
+                    f"sample {sample_index} supervises an anticipation control group"
+                )
+        count = sum(
+            label != -100 and bool(mask)
+            for label, mask in zip(labels[1:], attention[1:])
+        )
+        if count == 0:
+            raise ValueError(f"sample {sample_index} has no causal targets")
+        supervised_tokens += count
+    if supervised_tokens == 0:
+        raise ValueError(f"cache has no supervised targets: {cache_path}")
+    return samples
+
+
+def load_explicit_cache(
+    cache_path: str | Path,
+    style: str,
+    split: str,
+    mode: str,
+    seed: int,
+    seq_len: int,
+    anticipatory_prob: float,
+    context_groups: int,
+    control_offset: int,
+) -> list[tuple[list[int], list[int], list[int]]]:
+    """Load one explicitly selected cache and verify its embedded identity."""
+    cache_path = Path(cache_path)
+    if not cache_path.is_file():
+        raise FileNotFoundError(f"selected cache does not exist: {cache_path}")
+    with cache_path.open("rb") as handle:
+        cached = pickle.load(handle)
+    return _validate_cached_payload(
+        cached, cache_path, style, split, mode, seed, seq_len,
+        anticipatory_prob, context_groups, control_offset,
+    )
+
+
+def discover_cache_selection(
+    cache_dir: str | Path,
+    cfg: dict,
+    styles: tuple[str, ...] = ("baroque", "romantic"),
+) -> dict:
+    """Resolve one and only one compatible cache for each training/validation role."""
+    cache_dir = Path(cache_dir)
+    if not cache_dir.is_dir():
+        raise FileNotFoundError(f"cache directory does not exist: {cache_dir}")
+    tcfg = cfg["training"]
+    seed, seq_len, train_probability, context_groups = (
+        _explicit_cache_training_settings(tcfg)
+    )
+    from anticipation.vocab import CONTROL_OFFSET
+    entries: dict[str, dict[str, str]] = {}
+    for style in styles:
+        entries[style] = {}
+        roles = (
+            ("train", "mixed", "train_mixed", train_probability),
+            ("val", "unconditional", "val_unconditional", 0.0),
+            ("val", "conditioned", "val_conditioned", 0.0),
+        )
+        for split, mode, role, probability in roles:
+            candidates = sorted(
+                path for path in cache_dir.iterdir()
+                if path.is_file()
+                and path.name.startswith(f"{style}_{split}_")
+                and path.name.endswith(f"_{CACHE_SCHEMA}.pkl")
+            )
+            compatible = []
+            failures = []
+            for candidate in candidates:
+                try:
+                    load_explicit_cache(
+                        candidate, style, split, mode, seed, seq_len,
+                        probability, context_groups, CONTROL_OFFSET,
+                    )
+                except (ValueError, PreprocessingRejectedError) as exc:
+                    failures.append(f"{candidate.name}: {exc}")
+                else:
+                    compatible.append(candidate)
+            if len(compatible) != 1:
+                detail = "; ".join(failures) or "no matching cache found"
+                raise ValueError(
+                    f"expected exactly one compatible {style}/{split}/{mode} "
+                    f"cache, found {len(compatible)}; {detail}"
+                )
+            entries[style][role] = str(compatible[0].resolve())
+    return {
+        "schema": CACHE_SELECTION_SCHEMA,
+        "cache_dir": str(cache_dir.resolve()),
+        "entries": entries,
+    }
+
+
+def _load_cache_selection(path: str | Path, cache_dir: Path) -> dict:
+    selection_path = Path(path)
+    with selection_path.open(encoding="utf-8") as handle:
+        selection = json.load(handle)
+    if selection.get("schema") != CACHE_SELECTION_SCHEMA:
+        raise ValueError(f"incompatible cache-selection schema in {selection_path}")
+    if Path(selection.get("cache_dir", "")).resolve() != cache_dir.resolve():
+        raise ValueError(
+            f"cache selection points to {selection.get('cache_dir')}, "
+            f"but config selects {cache_dir}"
+        )
+    return selection
+
+
+def load_selected_cache_set(
+    selection: dict,
+    cache_dir: Path,
+    style: str,
+    seed: int,
+    seq_len: int,
+    anticipatory_prob: float,
+    context_groups: int,
+    control_offset: int,
+) -> tuple[
+    list[tuple[list[int], list[int], list[int]]],
+    dict[str, list[tuple[list[int], list[int], list[int]]]],
+]:
+    if selection.get("schema") != CACHE_SELECTION_SCHEMA:
+        raise ValueError("incompatible explicit cache selection schema")
+    if Path(selection.get("cache_dir", "")).resolve() != cache_dir.resolve():
+        raise ValueError("explicit cache selection does not match configured cache dir")
+    entries = selection.get("entries", {}).get(style)
+    expected_roles = {"train_mixed", "val_unconditional", "val_conditioned"}
+    if not isinstance(entries, dict) or set(entries) != expected_roles:
+        raise ValueError(
+            f"cache selection for {style} must contain exactly "
+            f"{sorted(expected_roles)}"
+        )
+    for role, cache_file in entries.items():
+        if Path(cache_file).resolve().parent != cache_dir.resolve():
+            raise ValueError(
+                f"selected cache {cache_file} is outside {cache_dir.resolve()}"
+            )
+    train_samples = load_explicit_cache(
+        entries["train_mixed"], style, "train", "mixed", seed, seq_len,
+        anticipatory_prob, context_groups, control_offset,
+    )
+    validation_samples = {
+        "unconditional": load_explicit_cache(
+            entries["val_unconditional"], style, "val", "unconditional",
+            seed, seq_len, 0.0, context_groups, control_offset,
+        ),
+        "conditioned": load_explicit_cache(
+            entries["val_conditioned"], style, "val", "conditioned",
+            seed, seq_len, 0.0, context_groups, control_offset,
+        ),
+    }
+    return train_samples, validation_samples
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 # ---------------------------------------------------------------------------
 # Model helpers
 # ---------------------------------------------------------------------------
@@ -634,33 +940,43 @@ def _verify_lora_targets(model, target_modules: list[str]) -> None:
             print(f"  LoRA target '{target}': found ok")
 
 
-def _assert_dtypes(model) -> None:
-    """Assert base params are fp16 and LoRA params are fp32."""
+def _assert_trainable_parameters(model) -> None:
+    """Require a frozen base and fp32 trainable LoRA weights."""
     import torch
 
-    lora_fp32_ok = True
-    base_fp16_ok = True
-    for name, param in model.named_parameters():
-        is_lora = "lora_" in name
-        if is_lora and param.requires_grad:
-            if param.dtype != torch.float32:
-                print(f"  WARNING: LoRA param {name} is {param.dtype}, expected float32")
-                lora_fp32_ok = False
-        elif not param.requires_grad:
-            if param.dtype != torch.float16:
-                # Some non-trainable params may be fp32 (e.g. layer norms) — warn only
-                pass
-    if lora_fp32_ok:
-        print("  LoRA params dtype: float32 ok")
-    # Print a sample
-    for name, param in model.named_parameters():
-        if "lora_" in name and param.requires_grad:
-            print(f"  Sample LoRA param: {name} dtype={param.dtype}")
-            break
+    trainable = []
     for name, param in model.named_parameters():
         if not param.requires_grad:
-            print(f"  Sample frozen param: {name} dtype={param.dtype}")
-            break
+            continue
+        if "lora_" not in name:
+            raise RuntimeError(f"non-LoRA base parameter is trainable: {name}")
+        if param.dtype != torch.float32:
+            raise RuntimeError(
+                f"trainable LoRA parameter {name} is {param.dtype}, expected float32"
+            )
+        trainable.append(name)
+    if not trainable:
+        raise RuntimeError("no trainable LoRA parameters were found")
+    print(f"  Frozen base; {len(trainable)} trainable fp32 LoRA tensors")
+
+
+def _assert_scaler_did_not_skip(scale_before: float, scale_after: float) -> None:
+    if scale_after < scale_before:
+        raise RuntimeError(
+            "GradScaler skipped an optimizer update after detecting non-finite "
+            f"gradients (scale {scale_before} -> {scale_after}); training stopped"
+        )
+
+
+def _causal_supervised_token_count(
+    labels: list[int], attention: list[int]
+) -> int:
+    if len(labels) != len(attention):
+        raise ValueError("labels and attention mask must have equal lengths")
+    return sum(
+        label != -100 and bool(mask)
+        for label, mask in zip(labels[1:], attention[1:])
+    )
 
 
 def _evaluate_validation(
@@ -684,13 +1000,10 @@ def _evaluate_validation(
             labels_t = torch.tensor([labels], dtype=torch.long, device=device)
             attention_t = torch.tensor([attention], dtype=torch.long, device=device)
             # Causal LM loss shifts internally, so position zero is never a target.
-            count = sum(
-                label != -100 and mask
-                for label, mask in zip(labels[1:], attention[1:])
-            )
+            count = _causal_supervised_token_count(labels, attention)
             if count == 0:
                 continue
-            with autocast():
+            with autocast(enabled=device == "cuda"):
                 output = model(
                     input_ids=ids_t,
                     attention_mask=attention_t,
@@ -712,10 +1025,14 @@ def _evaluate_validation(
 
 def train(
     style: str,
-    manifest_path: str,
+    manifest_path: str | None,
     drive_dir: str,
     cfg: dict,
     dry_run: bool = False,
+    cache_selection: dict | None = None,
+    cache_only: bool = False,
+    smoke_test: bool = False,
+    config_path: str | None = None,
 ) -> None:
     import torch
     from torch.cuda.amp import GradScaler, autocast
@@ -723,11 +1040,42 @@ def train(
     import anticipation.vocab as acfg
 
     tcfg = cfg["training"]
+    if dry_run and smoke_test:
+        raise ValueError("--dry_run and --smoke-test are mutually exclusive")
+    if cache_only and cache_selection is None:
+        raise ValueError("--cache-only requires an explicit cache selection")
     experiment_root = new_experiment_root(tcfg, drive_dir)
-    save_dir = prepare_new_adapter_dir(experiment_root, style)
+    if cache_selection is not None:
+        cache_seed, cache_seq_len, train_probability, cache_context_groups = (
+            _explicit_cache_training_settings(tcfg)
+        )
+    else:
+        cache_seed = int(tcfg["random_seed"])
+        cache_seq_len = tcfg["seq_len"]
+        train_probability = float(tcfg.get("anticipatory_prob", 0.5))
+        cache_context_groups = int(tcfg.get("context_groups", 170))
+    control_offset = acfg.CONTROL_OFFSET
+    seq_len = cache_seq_len
+    invalid_window_policy = tcfg.get(
+        "invalid_window_policy", INVALID_WINDOW_POLICY
+    )
+    if invalid_window_policy != INVALID_WINDOW_POLICY:
+        raise ValueError(
+            f"unsupported invalid_window_policy {invalid_window_policy!r}; "
+            f"only {INVALID_WINDOW_POLICY!r} is allowed"
+        )
+    cache_dir = experiment_root / "token_cache"
+    selected_cache_samples = None
+    if cache_selection is not None:
+        selected_cache_samples = load_selected_cache_set(
+            cache_selection, cache_dir, style, cache_seed,
+            seq_len, train_probability, cache_context_groups, control_offset,
+        )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
+    if smoke_test and device != "cuda":
+        raise RuntimeError("--smoke-test requires a CUDA runtime")
 
     seed = cfg["training"]["random_seed"]
     rng = random.Random(seed)
@@ -735,11 +1083,17 @@ def train(
 
     # Load model
     base = load_base_model(cfg["model"]["name"], device)
+    for parameter in base.parameters():
+        parameter.requires_grad = False
+    if hasattr(base, "config") and hasattr(base.config, "use_cache"):
+        base.config.use_cache = False
     for module in base.modules():  # base model was not trained with dropout
         if isinstance(module, torch.nn.Dropout):
             module.p = 0.0
     base.enable_input_require_grads()
     base.gradient_checkpointing_enable()
+    if hasattr(base, "is_gradient_checkpointing") and not base.is_gradient_checkpointing:
+        raise RuntimeError("gradient checkpointing did not enable on the base model")
 
     lora_cfg_dict = cfg["lora"]
     _verify_lora_targets(base, lora_cfg_dict["target_modules"])
@@ -754,69 +1108,77 @@ def train(
     )
     model = get_peft_model(base, lora_config)
     model.print_trainable_parameters()
-    _assert_dtypes(model)
+    _assert_trainable_parameters(model)
+    if hasattr(model, "config") and hasattr(model.config, "use_cache"):
+        model.config.use_cache = False
 
-    max_steps = 5 if dry_run else tcfg["max_steps"]
-    seq_len = tcfg["seq_len"]
+    max_steps = 1 if smoke_test else (5 if dry_run else tcfg["max_steps"])
     micro_batch = tcfg["micro_batch"]
     grad_accum = tcfg["grad_accum"]
     save_every = tcfg["save_every"]
-    control_offset = acfg.CONTROL_OFFSET
-    invalid_window_policy = tcfg.get(
-        "invalid_window_policy", INVALID_WINDOW_POLICY
-    )
     print(f"CONTROL_OFFSET = {control_offset}")
 
-    # Data
-    train_windows = load_windows(manifest_path, style, "train")
-    val_windows = load_windows(manifest_path, style, "val")
-    rng.shuffle(train_windows)
-    window_limit = tcfg.get("max_train_windows_per_style", 600)
-    n_train = min(8, len(train_windows)) if dry_run else min(
-        window_limit, len(train_windows)
-    )
-    train_windows = train_windows[:n_train]
-    print(
-        f"Train windows: {len(train_windows)} (limit {window_limit}), "
-        f"Val windows: {len(val_windows)}"
-    )
-
-    # Cache tokenised windows
-    cache_dir = experiment_root / "token_cache"
-    print("Building token cache (skips if already done)...")
-    cache_started = time.perf_counter()
-    performance_cache: dict[str, list[tuple[float, float, int]]] = {}
-    training_diagnostics = build_cache(
-        train_windows, style, "train", control_offset, seq_len, cache_dir,
-        seed, performance_cache, mode="mixed",
-        anticipatory_prob=tcfg.get("anticipatory_prob", 0.5),
-        context_groups=tcfg.get("context_groups", 170),
-        invalid_window_policy=invalid_window_policy,
-    )
-    print(f"  Training preprocessing: {json.dumps(training_diagnostics, sort_keys=True)}")
-    val_diagnostics = {}
-    val_samples_by_mode = {}
-    for validation_mode in ("unconditional", "conditioned"):
-        val_diagnostics[validation_mode] = build_cache(
-        val_windows, style, "val", control_offset, seq_len, cache_dir,
-            seed, performance_cache, mode=validation_mode,
-            anticipatory_prob=0.0,
+    train_windows: list[dict] = []
+    val_windows: list[dict] = []
+    if selected_cache_samples is not None:
+        train_samples, val_samples_by_mode = selected_cache_samples
+        val_diagnostics = {}
+        print(f"Loaded explicitly selected caches from {cache_dir}")
+    else:
+        if manifest_path is None:
+            raise ValueError("manifest_path is required unless explicit caches are selected")
+        train_windows = load_windows(manifest_path, style, "train")
+        val_windows = load_windows(manifest_path, style, "val")
+        rng.shuffle(train_windows)
+        window_limit = tcfg.get("max_train_windows_per_style", 600)
+        n_train = min(8, len(train_windows)) if dry_run else min(
+            window_limit, len(train_windows)
+        )
+        train_windows = train_windows[:n_train]
+        print(
+            f"Train windows: {len(train_windows)} (limit {window_limit}), "
+            f"Val windows: {len(val_windows)}"
+        )
+        print("Building token cache (skips if already done)...")
+        cache_started = time.perf_counter()
+        performance_cache: dict[str, list[tuple[float, float, int]]] = {}
+        training_diagnostics = build_cache(
+            train_windows, style, "train", control_offset, seq_len, cache_dir,
+            seed, performance_cache, mode="mixed",
+            anticipatory_prob=tcfg.get("anticipatory_prob", 0.5),
             context_groups=tcfg.get("context_groups", 170),
             invalid_window_policy=invalid_window_policy,
         )
-        val_samples_by_mode[validation_mode] = load_cached(
-            cache_dir, style, "val", seed, val_windows, control_offset, seq_len,
-            mode=validation_mode, anticipatory_prob=0.0,
+        print(
+            f"  Training preprocessing: "
+            f"{json.dumps(training_diagnostics, sort_keys=True)}"
+        )
+        val_diagnostics = {}
+        val_samples_by_mode = {}
+        for validation_mode in ("unconditional", "conditioned"):
+            val_diagnostics[validation_mode] = build_cache(
+                val_windows, style, "val", control_offset, seq_len, cache_dir,
+                seed, performance_cache, mode=validation_mode,
+                anticipatory_prob=0.0,
+                context_groups=tcfg.get("context_groups", 170),
+                invalid_window_policy=invalid_window_policy,
+            )
+            val_samples_by_mode[validation_mode] = load_cached(
+                cache_dir, style, "val", seed, val_windows, control_offset, seq_len,
+                mode=validation_mode, anticipatory_prob=0.0,
+                context_groups=tcfg.get("context_groups", 170),
+                invalid_window_policy=invalid_window_policy,
+            )
+        print(
+            f"Token cache build/check time: "
+            f"{time.perf_counter() - cache_started:.1f}s"
+        )
+        train_samples = load_cached(
+            cache_dir, style, "train", seed, train_windows, control_offset, seq_len,
+            mode="mixed", anticipatory_prob=tcfg.get("anticipatory_prob", 0.5),
             context_groups=tcfg.get("context_groups", 170),
             invalid_window_policy=invalid_window_policy,
         )
-    print(f"Token cache build/check time: {time.perf_counter() - cache_started:.1f}s")
-    train_samples = load_cached(
-        cache_dir, style, "train", seed, train_windows, control_offset, seq_len,
-        mode="mixed", anticipatory_prob=tcfg.get("anticipatory_prob", 0.5),
-        context_groups=tcfg.get("context_groups", 170),
-        invalid_window_policy=invalid_window_policy,
-    )
     if not train_samples:
         raise ValueError(f"No supervised training examples for {style}; see diagnostics")
     for validation_mode, mode_samples in val_samples_by_mode.items():
@@ -825,6 +1187,74 @@ def train(
             f"diagnostics={json.dumps(val_diagnostics[validation_mode], sort_keys=True)}"
         )
     print(f"Loaded {len(train_samples)} supervised train examples")
+
+    save_dir = None if smoke_test else prepare_new_adapter_dir(
+        experiment_root, style
+    )
+    if save_dir is not None:
+        if config_path is not None:
+            config_bytes = Path(config_path).read_bytes()
+        else:
+            config_bytes = yaml.safe_dump(
+                cfg, sort_keys=False, allow_unicode=True
+            ).encode("utf-8")
+        config_copy = save_dir / "training_config.yaml"
+        with config_copy.open("xb") as handle:
+            handle.write(config_bytes)
+        cache_identities = {}
+        if cache_selection is not None:
+            selected_entries = cache_selection["entries"][style]
+            cache_identities = {
+                role: {
+                    "path": str(Path(path).resolve()),
+                    "sha256": _sha256_file(Path(path)),
+                }
+                for role, path in selected_entries.items()
+            }
+        else:
+            cache_identities = {
+                "train_mixed": {
+                    "path": str(_cache_path(
+                        cache_dir, style, "train", seed, train_windows,
+                        control_offset, seq_len, "mixed",
+                        tcfg.get("anticipatory_prob", 0.5),
+                        tcfg.get("context_groups", 170),
+                    ).resolve()),
+                },
+                **{
+                    f"val_{mode}": {
+                        "path": str(_cache_path(
+                            cache_dir, style, "val", seed, val_windows,
+                            control_offset, seq_len, mode, 0.0,
+                            tcfg.get("context_groups", 170),
+                        ).resolve()),
+                    }
+                    for mode in ("unconditional", "conditioned")
+                },
+            }
+            for identity in cache_identities.values():
+                identity["sha256"] = _sha256_file(Path(identity["path"]))
+        provenance = {
+            "style": style,
+            "cache_schema": CACHE_SCHEMA,
+            "cache_identities": cache_identities,
+            "training_config_sha256": hashlib.sha256(config_bytes).hexdigest(),
+            "training_config_path": str(config_copy),
+            "manifest_and_source_fingerprints": (
+                "not available in explicit-cache mode; source files were not read"
+                if cache_selection is not None
+                else "cache identity includes source MIDI fingerprints"
+            ),
+            "excluded_window_provenance": (
+                "not available from selected caches; consult preserved Drive evidence"
+                if cache_selection is not None
+                else "see preprocessing diagnostics"
+            ),
+        }
+        provenance_path = save_dir / "training_provenance.json"
+        with provenance_path.open("x", encoding="utf-8") as handle:
+            json.dump(provenance, handle, indent=2, sort_keys=True)
+            handle.write("\n")
 
     # Optimizer
     optimizer = torch.optim.AdamW(
@@ -840,9 +1270,9 @@ def train(
         return 0.5 * (1 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    scaler = GradScaler()
+    scaler = GradScaler(enabled=device == "cuda")
 
-    log_path = save_dir / "train_log.jsonl"
+    log_path = save_dir / "train_log.jsonl" if save_dir is not None else None
     step = 0
 
     model.train()
@@ -851,8 +1281,13 @@ def train(
     rng.shuffle(sample_order)
     sample_idx = 0
 
-    if dry_run and device == "cuda":
+    if (dry_run or smoke_test) and device == "cuda":
         torch.cuda.reset_peak_memory_stats()
+    initial_trainable = (
+        [parameter.detach().clone() for parameter in model.parameters()
+         if parameter.requires_grad]
+        if smoke_test else []
+    )
 
     while step < max_steps:
         if device == "cuda":
@@ -872,9 +1307,8 @@ def train(
                 batch_labels.append(labels)
                 batch_mask.append(mask)
             valid_tokens = sum(
-                label != -100
-                for labels in batch_labels
-                for label in labels[1:]
+                _causal_supervised_token_count(labels, masks)
+                for labels, masks in zip(batch_labels, batch_mask)
             )
             micro_batches.append((batch_ids, batch_labels, batch_mask))
             token_counts.append(valid_tokens)
@@ -888,7 +1322,7 @@ def train(
             ids_t = torch.tensor(batch_ids, dtype=torch.long, device=device)
             lbl_t = torch.tensor(batch_labels, dtype=torch.long, device=device)
             mask_t = torch.tensor(batch_mask, dtype=torch.long, device=device)
-            with autocast():
+            with autocast(enabled=device == "cuda"):
                 output = model(
                     input_ids=ids_t, attention_mask=mask_t, labels=lbl_t
                 )
@@ -897,9 +1331,18 @@ def train(
             step_loss += float(output.loss.item()) * weight
 
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        gradient_norm = torch.nn.utils.clip_grad_norm_(
+            (p for p in model.parameters() if p.requires_grad), 1.0
+        )
+        if not torch.isfinite(gradient_norm) or gradient_norm.item() <= 0:
+            raise RuntimeError(
+                f"optimizer step {step + 1} has invalid gradient norm "
+                f"{gradient_norm.item()}"
+            )
+        scale_before = scaler.get_scale()
         scaler.step(optimizer)
         scaler.update()
+        _assert_scaler_did_not_skip(scale_before, scaler.get_scale())
         scheduler.step()
         optimizer.zero_grad()
         step += 1
@@ -923,6 +1366,35 @@ def train(
             print(f"[dry_run] step {step}: loss={log_entry['train_loss']:.4f} "
                   f"s/optimizer_step={elapsed:.2f} "
                   f"peak_gpu={memory_report}")
+        elif smoke_test:
+            updated_trainable = [
+                parameter for parameter in model.parameters()
+                if parameter.requires_grad
+            ]
+            changed = any(
+                not torch.equal(before, after.detach())
+                for before, after in zip(initial_trainable, updated_trainable)
+            )
+            if not changed:
+                raise RuntimeError("real optimizer step did not update any LoRA parameter")
+            model.eval()
+            smoke_metrics = {}
+            for validation_mode, mode_samples in val_samples_by_mode.items():
+                metrics = _evaluate_validation(
+                    model, mode_samples, device,
+                    tcfg.get("validation_max_examples"),
+                )
+                if metrics["examples"] <= 0 or not math.isfinite(metrics["loss"]):
+                    raise RuntimeError(
+                        f"smoke validation {validation_mode} produced no finite loss"
+                    )
+                smoke_metrics[validation_mode] = metrics
+            model.train()
+            print(
+                "SMOKE TEST PASSED: one LoRA optimizer update changed parameters; "
+                f"validation={json.dumps(smoke_metrics, sort_keys=True)}"
+            )
+            return
         else:
             # Full deterministic validation by default; limit is in examples.
             if step % 10 == 0:
@@ -953,7 +1425,7 @@ def train(
                 model.save_pretrained(str(ckpt_dir))
                 print(f"Saved checkpoint: {ckpt_dir}")
 
-            if step == 50:
+            if step == 50 and val_windows:
                 _check_skyline_dominance(
                     model, val_windows[:4], control_offset, seq_len, device
                 )
@@ -1005,13 +1477,15 @@ def _check_skyline_dominance(model, windows, control_offset, seq_len, device):
         controls = [t + control_offset for t in mel_events]
 
         model.eval()
-        with constrained_sampling(), torch.no_grad():
-            output = generate_conditioned(
-                model, start_time=0, end_time=max(n.end for n in mel),
-                inputs=[], controls=controls, top_p=0.95,
-                max_events=100_000,
-            )
-        model.train()
+        try:
+            with constrained_sampling(), torch.no_grad():
+                output = generate_conditioned(
+                    model, start_time=0, end_time=max(n.end for n in mel),
+                    inputs=[], controls=controls, top_p=0.95,
+                    max_events=100_000,
+                )
+        finally:
+            model.train()
 
         gen_pm = events_to_pretty_midi(output)
         gen_notes = [FNote(n.start, n.end, n.pitch)
@@ -1035,15 +1509,51 @@ def main() -> None:
     parser.add_argument("--style", choices=["baroque", "romantic"], required=True)
     parser.add_argument("--dry_run", action="store_true",
                         help="Run 5 steps on 8 windows to validate pipeline")
+    parser.add_argument(
+        "--cache-selection",
+        help="JSON file selecting exact validated train/validation cache paths",
+    )
+    parser.add_argument(
+        "--cache-only",
+        action="store_true",
+        help="Require explicit caches; do not read manifests/MIDI or build caches",
+    )
+    parser.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help="Run one CUDA update and both cached validation objectives; save no adapter",
+    )
     args = parser.parse_args()
 
-    with open(args.config) as f:
+    config_path = Path(args.config).resolve()
+    with config_path.open() as f:
         cfg = yaml.safe_load(f)
 
-    manifest_path = str(Path(cfg["data"]["output_dir"]) / "manifest.csv")
     drive_dir = cfg["training"]["drive_dir"]
+    manifest_path = (
+        None if args.cache_only
+        else str(Path(cfg["data"]["output_dir"]) / "manifest.csv")
+    )
 
-    train(args.style, manifest_path, drive_dir, cfg, dry_run=args.dry_run)
+    if args.cache_only and not args.cache_selection:
+        parser.error("--cache-only requires --cache-selection")
+    if args.cache_selection and not args.cache_only:
+        parser.error("--cache-selection must be used with --cache-only")
+    selection = None
+    if args.cache_selection:
+        cache_dir = new_experiment_root(cfg["training"], drive_dir) / "token_cache"
+        selection = _load_cache_selection(args.cache_selection, cache_dir)
+    train(
+        args.style,
+        None if args.cache_only else manifest_path,
+        drive_dir,
+        cfg,
+        dry_run=args.dry_run,
+        cache_selection=selection,
+        cache_only=args.cache_only,
+        smoke_test=args.smoke_test,
+        config_path=str(config_path),
+    )
 
 
 if __name__ == "__main__":

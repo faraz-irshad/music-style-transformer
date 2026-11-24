@@ -78,6 +78,35 @@ Style-Conditioned Piano Accompaniment Generation — BSc Thesis, ELTE
   diagnostics, and musical quality remain **UNVERIFIED** pending an equipped
   runtime and listening.
 
+## neural_alignment_v1 training-path audit
+
+- Added manifest-free `--cache-only` training with exact cache-selection
+  metadata validation. The Colab cell resolves exactly one compatible cache
+  per style/objective, rejects missing/ambiguous/incompatible caches, and
+  records each cache path/hash plus the exact saved training config for full
+  runs. Cache-only mode does not hash MIDI sources or rebuild caches.
+- Enforced a frozen base and fp32 trainable LoRA tensors, disabled
+  `use_cache` with gradient checkpointing, masked-token-aware accumulation,
+  token-weighted unconditional/conditioned validation, and explicit failure
+  if a non-finite gradient causes GradScaler to skip an optimizer update.
+- The Colab notebook restores
+  `/content/drive/MyDrive/thesis_results/alignment_v1_data/config.alignment_v1.yaml`
+  without merging defaults. It preserves any surviving manifest/exclusion
+  evidence on Drive, or records the provenance gap if the local evidence is
+  absent. It runs one real CUDA update plus both validation objectives before
+  allowing full training.
+- Checkpoint behavior remains periodic checkpoints plus `final`; there is no
+  automatic best-checkpoint selection because no selection objective is
+  documented.
+- Tests executed: `python3 -m pytest -q tests/test_neural_alignment.py
+  tests/test_train_lora.py` — 55 passed; `python3 -m pytest -q` — 94 passed,
+  8 skipped. `python3 -m compileall -q model/training tests`, notebook JSON
+  and code-cell compilation, and `git diff --check` passed.
+- No CUDA smoke test, model load, optimizer update, real-cache validation
+  forward, full training, cache rebuild, or dataset access was run here.
+  Whether the exclusion log/manifest backup still exists on Drive remains
+  **UNVERIFIED** until the Colab evidence check runs.
+
 ## Review round 3 (2026-11-23)
 
 | Item | Status | Notes |
