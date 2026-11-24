@@ -634,9 +634,9 @@ def test_saved_melody_round_trip_preserves_notes_within_midi_tick(tmp_path, monk
         assert abs(end - source_end) <= tick_seconds
 
 
-def test_default_generation_endpoint_uses_last_melody_note():
+def test_default_generation_endpoint_uses_last_melody_note(monkeypatch):
     torch_stub = types.ModuleType("torch")
-    sys.modules.setdefault("torch", torch_stub)
+    monkeypatch.setitem(sys.modules, "torch", torch_stub)
     generation = importlib.import_module("model.generation.generate")
     assert generation.melody_endpoint([(0.0, 0.6, 60), (3.0, 9.6, 64)]) == 9.6
     assert generation.melody_endpoint([]) == 0.0
@@ -1417,6 +1417,53 @@ def test_finite_gradient_elements_with_nonfinite_norm_reduction_fail_distinctly(
             step=2,
         )
     assert parameter.grad.mul_calls == []
+
+
+def test_smoke_lr_lambda_offsets_only_the_smoke_test():
+    import model.training.train_lora as training
+
+    def warmup(index):
+        return index / 10
+
+    smoke = training._smoke_test_lr_lambda(warmup, True)
+    full = training._smoke_test_lr_lambda(warmup, False)
+    assert smoke(0) == pytest.approx(0.1)
+    assert full(0) == 0.0
+    assert smoke(4) == full(5)
+
+
+def test_smoke_lr_and_parameter_change_with_cpu_torch_tensors():
+    torch = pytest.importorskip("torch")
+    import model.training.train_lora as training
+
+    def warmup(index):
+        return index / 10
+
+    smoke_optimizer = torch.optim.SGD(
+        [torch.nn.Parameter(torch.tensor([2.0]))], lr=0.1
+    )
+    smoke_scheduler = torch.optim.lr_scheduler.LambdaLR(
+        smoke_optimizer, training._smoke_test_lr_lambda(warmup, True)
+    )
+    assert smoke_optimizer.param_groups[0]["lr"] == pytest.approx(0.01)
+
+    full_optimizer = torch.optim.SGD(
+        [torch.nn.Parameter(torch.tensor([2.0]))], lr=0.1
+    )
+    torch.optim.lr_scheduler.LambdaLR(
+        full_optimizer, training._smoke_test_lr_lambda(warmup, False)
+    )
+    assert full_optimizer.param_groups[0]["lr"] == 0.0
+
+    parameter = torch.nn.Parameter(torch.tensor([2.0]))
+    optimizer = torch.optim.SGD([parameter], lr=0.01)
+    before = [parameter.detach().clone()]
+    optimizer.zero_grad()
+    parameter.square().sum().backward()
+    optimizer.step()
+    assert training._training_parameters_changed(
+        before, [parameter], torch
+    )
 
 
 def test_optimizer_skip_and_causal_attention_count_are_explicit():

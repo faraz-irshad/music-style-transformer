@@ -107,6 +107,18 @@ Style-Conditioned Piano Accompaniment Generation — BSc Thesis, ELTE
   Whether the exclusion log/manifest backup still exists on Drive remains
   **UNVERIFIED** until the Colab evidence check runs.
 
+## neural_alignment_v1 Baroque CUDA smoke-test report
+
+- User-reported real-cache smoke test passed on a Tesla T4 after initializing
+  GradScaler at `1.0` and giving only smoke tests a positive first warmup
+  learning rate. The full-training LR schedule is unchanged.
+- The run completed one optimizer update and changed LoRA parameters. Reported
+  validation: unconditional, 146 examples / 42,543 supervised tokens / loss
+  `6.914369360363775`; conditioned, 125 examples / 22,353 supervised tokens /
+  loss `7.027337366551333`. No AMP backoff was reported.
+- This was a **user-executed Baroque** CUDA smoke test. Romantic GPU validation
+  and musical quality remain **UNVERIFIED**; this is not a listening test.
+
 ## Review round 3 (2026-11-23)
 
 | Item | Status | Notes |

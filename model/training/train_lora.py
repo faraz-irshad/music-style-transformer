@@ -1034,6 +1034,20 @@ def _require_finite_loss(loss: float, scale: float, step: int) -> None:
         )
 
 
+def _training_parameters_changed(before, after, torch) -> bool:
+    if len(before) != len(after):
+        raise ValueError("trainable parameter count changed during optimizer update")
+    return any(
+        not torch.equal(previous, current.detach())
+        for previous, current in zip(before, after)
+    )
+
+
+def _smoke_test_lr_lambda(lr_lambda, smoke_test: bool):
+    offset = int(smoke_test)
+    return lambda index: lr_lambda(index + offset)
+
+
 def _inspect_and_clip_gradients(
     named_parameters,
     torch,
@@ -1389,6 +1403,7 @@ def train(
     if hasattr(model, "config") and hasattr(model.config, "use_cache"):
         model.config.use_cache = False
 
+    initial_amp_scale = 1.0
     save_dir = None if smoke_test else prepare_new_adapter_dir(
         experiment_root, style
     )
@@ -1438,6 +1453,8 @@ def train(
         provenance = {
             "style": style,
             "cache_schema": CACHE_SCHEMA,
+            "amp_enabled": device == "cuda",
+            "amp_initial_scale": initial_amp_scale,
             "cache_identities": cache_identities,
             "training_config_sha256": hashlib.sha256(config_bytes).hexdigest(),
             "training_config_path": str(config_copy),
@@ -1470,8 +1487,10 @@ def train(
         progress = (step - warmup) / max(max_steps - warmup, 1)
         return 0.5 * (1 + math.cos(math.pi * progress))
 
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    scaler = GradScaler(enabled=device == "cuda")
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, _smoke_test_lr_lambda(lr_lambda, smoke_test)
+    )
+    scaler = GradScaler(enabled=device == "cuda", init_scale=initial_amp_scale)
 
     log_path = save_dir / "train_log.jsonl" if save_dir is not None else None
     step = 0
@@ -1559,6 +1578,7 @@ def train(
             "train_loss": step_loss,
             "s_per_step": elapsed,
             "amp_retries": retries,
+            "amp_initial_scale": initial_amp_scale,
         }
 
         if dry_run:
@@ -1576,9 +1596,8 @@ def train(
                 parameter for parameter in model.parameters()
                 if parameter.requires_grad
             ]
-            changed = any(
-                not torch.equal(before, after.detach())
-                for before, after in zip(initial_trainable, updated_trainable)
+            changed = _training_parameters_changed(
+                initial_trainable, updated_trainable, torch
             )
             if not changed:
                 raise RuntimeError("real optimizer step did not update any LoRA parameter")
